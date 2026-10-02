@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Literal, TypeAlias
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRequest, dynamic_prompt
 from langchain.chat_models import init_chat_model
-from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from src.agent.checkpoint import make_thread_id
 from src.agent.tools import (
     _get_memories_by_keys,
     _recall_memories,
@@ -37,12 +38,22 @@ llm = init_chat_model(
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
-checkpointer = InMemorySaver()
-agent = create_agent(
-    model=llm,
-    tools=tools,
-    checkpointer=checkpointer,
-)
+
+@dynamic_prompt
+def conversation_prompt(request: ModelRequest) -> str:
+    """Use this turn's recall context without saving it as chat history."""
+    return request.runtime.context["system_prompt"]
+
+
+def build_agent(checkpointer):
+    """Build the conversation agent with an application-owned checkpointer."""
+    return create_agent(
+        model=llm,
+        tools=tools,
+        checkpointer=checkpointer,
+        middleware=[conversation_prompt],
+    )
+
 
 MemoryKey: TypeAlias = Literal[
     "career_direction",
@@ -329,8 +340,8 @@ def validate_memory_resolutions(
 
 
 # 记忆debugger
-def debug_memory(session_id: str):
-    config = {"configurable": {"thread_id": session_id}}
+def debug_memory(session_id: str, user_id: str, agent):
+    config = {"configurable": {"thread_id": make_thread_id(user_id, session_id)}}
 
     state = agent.get_state(config)
 
@@ -350,7 +361,7 @@ def debug_memory(session_id: str):
             print(message.tool_calls)
 
 
-def chat(message: str, session_id: str, user_id: str) -> str:
+def chat(message: str, session_id: str, user_id: str, agent) -> str:
     memory_cache: dict[str, list[dict]] = {}
 
     # =========================
@@ -452,10 +463,7 @@ def chat(message: str, session_id: str, user_id: str) -> str:
     print("memory_keys:", memory_keys)
     print("召回结果:", recalled_memories)
 
-    msgList = [
-        {
-            "role": "system",
-            "content": f"""
+    system_prompt = f"""
             你是一个带长期记忆能力的 Agent。
 
             当前用户 ID：
@@ -473,17 +481,12 @@ def chat(message: str, session_id: str, user_id: str) -> str:
             2. 长期记忆只是辅助上下文，不要强行套用。
             3. 如果当前用户明确表达的信息和长期记忆冲突，以当前消息为准。
             4. 不允许根据长期记忆推测用户没有明确表达的信息。
-            """,
-        },
-        {
-            "role": "user",
-            "content": message,
-        },
-    ]
+            """
 
     result = agent.invoke(
-        {"messages": msgList},
-        config={"configurable": {"thread_id": session_id}},
+        {"messages": [{"role": "user", "content": message}]},
+        config={"configurable": {"thread_id": make_thread_id(user_id, session_id)}},
+        context={"system_prompt": system_prompt},
     )
 
     candidate = judge_memory(message)

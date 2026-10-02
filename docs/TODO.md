@@ -1,6 +1,6 @@
 # 项目问题与后续工作 TODO
 
-更新日期：2026-09-30。本文记录问题、修复状态及验收条件。完成一个条目后，先补充验证结果，再勾选复选框。
+更新日期：2026-10-02。本文记录问题、修复状态及验收条件。完成一个条目后，先补充验证结果，再勾选复选框。
 
 原理、当前实现及学习实验见 [自动召回学习文档](auto_recall.md)。本文跟踪工作，该文解释原理。
 
@@ -12,21 +12,24 @@
 
 建议按以下顺序实施，每一步均使用隔离的测试数据：
 
-1. 依赖、导入和配置：BUG-08 → BUG-03 → BUG-04；配合 IMP-01，使离线验证不依赖外部服务。
-2. 身份和会话隔离：BUG-01、BUG-07，进入多人使用场景前完成。
+1. 依赖、导入和配置：直接依赖已补齐，仍需完成 BUG-08 的干净环境验证，以及 BUG-03、BUG-04；配合 IMP-01，使离线验证不依赖外部服务。
+2. 身份和会话隔离：BUG-01 的复合线程 ID 已进入主流程；仍需完成可信身份来源、Graph 工具身份绑定（BUG-07）及真实 PostgreSQL 验收，才能进入多人使用场景。
 3. 新增与替换的代码修复已一起完成：BUG-02、BUG-05；下一步做真实 Milvus 联调。
 4. Graph 多轮状态与调用示例：BUG-06、BUG-12。
 5. 数据导入、PDF 输出和演示：BUG-09、BUG-10、BUG-11、BUG-13。
-6. 推进持久化、召回效果评估及原有 Web 计划。
+6. 验证 PostgreSQL checkpoint 的完整 API 重启恢复、advisory lock 并发边界，继续召回效果评估及原有 Web 计划。
 
 ## 已确认问题
 
 ### BUG-01 · P1 · 会话历史未按用户隔离
 
-- [ ] 修复会话身份与 checkpoint 的绑定。
-- **位置**：[main.py](../src/agent/main.py) 的 `chat()`、`debug_memory()`；[server.py](../api/server.py) 的聊天接口。
-- **现象 / 触发条件**：`chat()` 只用 `session_id` 作为 `thread_id`。两个不同用户使用相同会话 ID 时，会命中同一份聊天历史。长期记忆查询的用户过滤不能隔离短期聊天历史。
-- **修复步骤**：统一生成由用户身份与会话 ID 组成的无歧义 `thread_id`；聊天、调试读取和 Graph 均使用它。API 用于多人场景时，用户身份应来自可信认证上下文，并校验会话归属，而不是只相信请求体里的 ID。
+- [x] 主 API 聊天与调试读取统一使用用户和会话组成的线程 ID。
+- [ ] 从可信认证上下文确定 `user_id`，并校验会话归属；目前请求体中的 ID 可被伪造。
+- [ ] 使用完整 API、两个用户和多个会话完成端到端隔离与重启恢复验证；目前仅验证 PostgreSQL checkpoint 的基础恢复。
+- **位置**：[checkpoint.py](../src/agent/checkpoint.py) 的 `make_thread_id()`；[main.py](../src/agent/main.py) 的 `chat()`、`debug_memory()`；[server.py](../api/server.py) 的聊天接口。
+- **原现象 / 触发条件**：`chat()` 只用 `session_id` 作为 `thread_id`。两个不同用户使用相同会话 ID 时，会命中同一份聊天历史。长期记忆查询的用户过滤不能隔离短期聊天历史。
+- **当前处理**：`make_thread_id(user_id, session_id)` 生成无歧义的复合 ID；主入口聊天和调试读取共用该函数。API 继续接收请求体中的 `user_id`，因此这一步解决误用相同会话 ID 的串线，尚不能提供真正的访问控制。独立 Graph 学习入口未纳入本次改造。
+- **后续步骤**：从服务端认证信息绑定身份，校验会话所有权，再将相同规则推广到独立 Graph 入口和记忆工具。
 - **验收条件**：用户 A、B 使用相同 `session_id` 时各自只能看到自己的消息；同一用户同一会话能继续上下文；同一用户不同会话互不混入；调试读取遵守相同规则。
 
 ### BUG-02 · P1 · 新增同类记忆会覆盖已有记录
@@ -43,8 +46,8 @@
 ### BUG-03 · P1 · 包导入依赖启动目录
 
 - [ ] 统一包结构、导入方式和启动命令。
-- **位置**：[server.py](../api/server.py) 的 `from agent.main import chat`；[graph.py](../src/agent/graph.py)、[smith.py](../src/agent/smith.py) 的裸模块导入；[Graph 示例](../src/agent/test/test_graph.py)、[数据查看脚本](../src/agent/test/showData.py) 等。
-- **现象 / 触发条件**：代码位于 `src/agent/`，API 却导入 `agent.main`；Graph 使用 `from model import model` 等导入。从项目根目录按包方式启动时，默认模块搜索路径不能找到这些模块。手工修改 `PYTHONPATH` 或切换目录会让不同入口行为不一致。
+- **位置**：[server.py](../api/server.py) 的项目根目录 `sys.path` 补丁；[graph.py](../src/agent/graph.py)、[smith.py](../src/agent/smith.py) 的裸模块导入；[Graph 示例](../src/agent/test/test_graph.py)、[数据查看脚本](../src/agent/test/showData.py) 等。
+- **现象 / 触发条件**：API 目前通过项目根目录 `sys.path` 补丁导入 `src.agent.main`；Graph 仍使用 `from model import model` 等裸模块导入。不同入口依赖不同的启动目录或搜索路径，尚未形成统一可安装的包结构。
 - **修复步骤**：将项目配置为可安装的包，或统一使用与当前布局匹配的包导入；同步修正内部相对导入、API 和示例，移除不再需要的 `sys.path` 补丁；记录根目录启动命令。
 - **验收条件**：干净环境中，从根目录按文档启动 API、导入 Graph 和运行示例不出现 `ModuleNotFoundError`；不需要切换到 `src/agent/`。先配合 IMP-01 避免离线导入触发外部初始化。
 
@@ -86,10 +89,12 @@
 
 ### BUG-08 · P1 · 主流程直接依赖未完整声明
 
-- [ ] 补齐可重建运行环境的依赖清单。
+- [x] 明确声明当前直接使用的 `langchain`、`langgraph` 和 PostgreSQL checkpoint 依赖。
+- [ ] 在干净环境中验证完整依赖安装、导入和离线测试。
+- [ ] 解决依赖冲突：`gradio==6.8.0` 要求 `aiofiles<25`，而当前 `unstructured-client==0.46.2` 要求 `aiofiles>=25.1.0`；本地 `pip check` 因此仍失败。评估是否拆分服务/解析环境或选择兼容版本，再重建依赖锁定文件。
 - **位置**：[requirements.txt](../requirements.txt)；[main.py](../src/agent/main.py)、[graph.py](../src/agent/graph.py)、[smith.py](../src/agent/smith.py) 的 `langchain` / `langgraph` 导入。
-- **现象 / 触发条件**：清单包含多个 LangChain 子包，却未直接声明使用的 `langchain` 和 `langgraph`。当前环境已安装的包可能掩盖问题；不能依赖偶然的传递依赖保证直接使用的模块可用。
-- **修复步骤**：核对运行时直接依赖，补充兼容版本约束；区分服务运行、解析和开发测试依赖；记录 Python 版本、嵌入模型及 Milvus 等外部条件。
+- **原现象 / 触发条件**：清单曾包含多个 LangChain 子包，却未直接声明使用的 `langchain` 和 `langgraph`。当前环境已安装的包可能掩盖问题；不能依赖偶然的传递依赖保证直接使用的模块可用。
+- **当前处理与后续**：清单现已列出 `langchain`、`langgraph`、`langgraph-checkpoint-postgres` 及 psycopg 依赖。仍需在干净环境验证版本兼容，并区分服务运行、解析和开发测试依赖；Python 版本、嵌入模型及 Milvus 等外部条件见项目说明。
 - **验收条件**：新建环境仅按文档安装后，依赖检查通过、直接使用模块可导入、离线测试通过。模型文件和外部服务另行准备，不混同于包安装成功。
 
 ### BUG-09 · P2 · 中文切块可能超出 VARCHAR 字节上限
@@ -146,10 +151,16 @@
 
 ### IMP-02 · P2 · 明确持久化与并发边界
 
-- [ ] 为会话历史制定持久化和并发方案。
-- **位置**：[main.py](../src/agent/main.py)、[graph.py](../src/agent/graph.py) 的 `InMemorySaver`。
-- **现状**：checkpoint 在进程内存，重启不保留，多进程不自然共享；适合学习和单进程演示，持久化需求需另行设计。
-- **实施步骤**：按部署方式选择持久化 checkpointer，沿用统一用户/会话标识；定义生命周期、同会话并发串行或冲突处理，以及迁移兼容策略。
+- [x] 主 API 复用现有 PostgreSQL，将 Agent checkpoint 从 `InMemorySaver` 迁到 PostgreSQL。
+- [x] 在真实 PostgreSQL 临时 schema 中用假聊天模型验证连接池重建后的两轮基础恢复。
+- [x] 启动建表及 `PostgresSaver.setup()` 使用事务级 advisory lock 协调多 worker 初始化。
+- [x] `/chat` 用 PostgreSQL 事务级 advisory lock 串行化同一用户/会话的请求，锁持有到 `ChatLog` 提交。
+- [ ] 使用完整 API、真实模型与 Milvus 验证重启、不同用户同名会话和多进程恢复。
+- [ ] 验证同一会话并发、跨 worker 顺序、锁等待超时与高负载延迟，并处理 checkpoint 与 `ChatLog` 不同事务的失败一致性。
+- **位置**：[checkpoint.py](../src/agent/checkpoint.py) 的 `checkpoint_dsn()`、`checkpoint_lock_id()`；[main.py](../src/agent/main.py) 的 `build_agent()`；[server.py](../api/server.py) 的生命周期与 `/chat` 锁；独立 [graph.py](../src/agent/graph.py) 仍使用 `InMemorySaver`。
+- **当前实现**：API 使用现有 `DATABASE_URL`，将 SQLAlchemy 的 asyncpg URL 转成 checkpoint 驱动可用的 PostgreSQL DSN，在应用生命周期中初始化、持有和关闭连接池。启动时的 SQLAlchemy 建表与 `PostgresSaver.setup()` 在固定的事务级 advisory lock 下执行，避免多个 worker 的 checkpoint 迁移竞态。`/chat` 根据用户/会话稳定生成锁键，先在 SQLAlchemy 事务里获取 `pg_advisory_xact_lock`，再调用 Agent，直到日志提交才释放；PostgreSQL 可协调不同 worker 的同一会话请求。`ChatLog` 保留为问答日志，不承担 checkpoint 恢复；旧内存 checkpoint 不自动迁移。
+- **验证记录**：2026-10-02，在真实 PostgreSQL 的临时 schema 执行 `PostgresSaver.setup()`；假聊天模型两轮调用中间关闭并重建连接池，恢复后包含 4 条 human/AI 消息，临时 schema 已删除。FastAPI 实际生命周期启动和 `/health` 返回 HTTP 200；两个真实数据库会话验证同一 advisory lock 会等待前一事务提交。该验证不覆盖完整 `/chat`、真实模型、Milvus、跨用户隔离或并发负载。
+- **后续步骤**：在完整 API 下验证同线程并发顺序及等待上限、多进程部署和高负载行为。checkpoint 使用独立连接池，与日志写入不是单个原子事务；若日志提交失败而 checkpoint 已成功，需要定义重试或补偿策略。如需让独立 Graph 入口持久化，另行设计其状态模型与连接生命周期。
 - **验收条件**：声明支持的部署方式下，重启可恢复；并发消息没有重复或混乱；用户隔离回归验证通过。
 
 ### IMP-03 · P2 · 评价召回效果并定义故障降级
@@ -175,7 +186,7 @@
 
 - [ ] 完成聊天函数的调用与依赖隔离验收。
 - **原计划**：“从 tools.py 导入工具，把 main.py 的 Agent Loop 封装为可调用函数”。
-- **当前状态：已有实现**。[main.py](../src/agent/main.py) 已有 `chat(message, session_id, user_id)` 并导入工具。
+- **当前状态：已有实现**。[main.py](../src/agent/main.py) 的 `chat(message, session_id, user_id, agent)` 接收由 `build_agent(checkpointer)` 构造的 Agent；API 在应用生命周期内创建并注入它。
 - **下一步 / 验收**：结合 BUG-01、BUG-04、IMP-01，验证 API 和离线调用复用同一函数，且配置、身份和外部依赖行为明确。
 
 ### PLAN-03 · P2 · 提供 POST /chat
@@ -187,10 +198,11 @@
 
 ### PLAN-04 · P2 · 暂存会话并迁移 checkpointer
 
-- [ ] 完成会话隔离和持久化规划。
+- [x] 主 API 使用 PostgreSQL checkpoint 并绑定复合线程 ID。
+- [ ] 完成完整 API 的真实数据库恢复、并发和认证验收；底层 PostgreSQL checkpoint 基础恢复已验证。
 - **原计划**：“用内存 dict 按 session_id 暂存对话历史（临时方案，后续换 LangGraph checkpointer）”。
-- **当前状态：部分完成，已有替代实现**。当前已用 `InMemorySaver`，但仍为内存存储；只使用 `session_id` 的主入口有 BUG-01。
-- **下一步 / 验收**：无需重新加入内存 dict；完成 BUG-01、BUG-06、IMP-02，说明恢复和部署边界。
+- **当前状态：主 API 已改造，Graph 示例未改造**。API 使用 PostgreSQL checkpointer；独立 `graph.py` 仍用 `InMemorySaver`，且存在 BUG-06 的消息合并问题。
+- **下一步 / 验收**：无需重新加入内存 dict；完成 BUG-01 的可信身份、BUG-06、IMP-02 的真实 PostgreSQL 和并发验证，说明两条入口的部署边界。
 
 ### PLAN-05 · P3 · 提供静态聊天页面
 
@@ -208,7 +220,7 @@
 
 ## 检查范围与验证限制
 
-- 依据上一轮审查结论，并在编写本文时重新核对上述源码和原 TODO。上一轮记录检查了 34 个 Python 文件，语法检查通过，关键问题做过离线复现；语法通过不代表启动、隔离和数据正确性通过。
-- 本次仅整理文档，没有修复业务代码，没有调用真实模型或写入数据库，没有读取或展示密钥。
+- 本文依据源码与现有测试更新状态；语法和离线测试通过不代表真实服务启动、跨用户隔离与数据持久化都已通过。
+- 2026-10-02 的会话改造以 [checkpoint.py](../src/agent/checkpoint.py)、[main.py](../src/agent/main.py) 和 [server.py](../api/server.py) 的实际代码与测试结果为准。本文记录了设计及尚未完成的完整 `/chat`、真实模型和 Milvus 联调，不将离线验证视为端到端验收。
 - 一部分缺陷可从源码与数据流确认；Milvus 实际行为、SDK/包版本兼容、真实召回效果、API 部署和浏览器整体验收，仍需在隔离环境中验证。
 - 后续修复记录应包含：关联编号、代码变更、离线验证结果、集成验证是否执行及其范围。不要仅凭文档描述勾选完成。

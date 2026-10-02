@@ -126,12 +126,13 @@ class MemoryUpdateTests(unittest.TestCase):
             "route_memory_keys": lambda message: [],
             "route_memory_keys_with_llm": lambda message: [],
             "should_recall_memory": lambda message: False,
-            "agent": SimpleNamespace(
-                invoke=lambda *args, **kwargs: {
-                    "messages": [SimpleNamespace(content="回答")]
-                }
-            ),
+            "make_thread_id": lambda user_id, session_id: f"{user_id}:{session_id}",
         }
+        self.agent = SimpleNamespace(
+            invoke=lambda *args, **kwargs: {
+                "messages": [SimpleNamespace(content="回答")]
+            }
+        )
         load_definitions(
             ROOT / "src/agent/main.py",
             {
@@ -173,7 +174,7 @@ class MemoryUpdateTests(unittest.TestCase):
 
     def chat(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            return self.flow["chat"]("用户本轮消息", "session-1", "user-a")
+            return self.flow["chat"]("用户本轮消息", "session-1", "user-a", self.agent)
 
     def test_replaces_selected_old_id_and_inserts_new_key_after_one_decision(self):
         legacy_id = hashlib.sha256(b"user-a:career_direction").hexdigest()

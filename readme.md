@@ -1,109 +1,74 @@
 # LLM Agent 项目
 
-> 大模型幻觉研究 · Agent 核心模块：记忆 / 规划 / 行动 / 工具
-
-## 项目文档
-
-- [问题与改进 TODO](docs/TODO.md)：已确认问题、修复顺序、验收条件，以及原有开发计划的状态。
-- [自动召回学习文档](docs/auto_recall.md)：结合当前代码讲解长期记忆读取、向量检索、Graph 改造和离线实验。
-- [学习进度路线（执行版）](docs/learning_progress_roadmap.md)：基于当前源码制定的分阶段学习地图、每周任务、练习和验收标准。
-- [Agent 学习路线](docs/agent_learning_roadmap.md)：整体学习计划；部分实现描述较早，记忆模块现状请结合上述文档与源码阅读。
-
----
-
-## 目录结构
-
-```
-agent/
-├── .env                        # 环境变量（API Key，不提交到 Git）
-├── readme.md
-│
-├── src/                        # 核心源码
-│   ├── agent/
-│   │   ├── main.py             # Agent 主入口（LangChain Tool-Call 循环）
-│   │   └── tools.py            # Agent 工具集（联网搜索、知识库检索）
-│   └── parsers/
-│       └── pdf_parser.py       # PDF 解析器（基于 MinerU HTTP API）
-│
-├── demos/                      # 学习示例
-│   ├── batch_demo.py           # 批量调用 vs 非批量调用对比
-│   ├── prompt_template_demo.py # Prompt Template 三种用法演示
-│   ├── runnable_branch_demo.py # LangChain RunnableBranch 条件路由
-│   └── parse_txt.py            # 文本文件加载示例
-│
-├── scripts/                    # 数据库管理脚本
-│   └── milvus/
-│       ├── create_db.py        # 创建 Milvus Collection
-│       ├── insert_db.py        # 文档向量化并写入 Milvus
-│       ├── query_db.py         # 查询 Collection 数据
-│       ├── search_db.py        # 向量相似度搜索
-│       ├── delete_data.py      # 删除指定数据
-│       └── quick_start.py      # Milvus 快速上手示例
-│
-├── projects/                   # 独立子项目
-│   └── crypto_bot/
-│       └── crypto_trading_bot.py  # 比特币 AI 合约交易机器人（仅供学习）
-│
-├── tests/                      # 测试脚本
-│   ├── test_api.py             # 阿里百炼 API 测试
-│   ├── test_gemini.py          # Google Gemini API 测试
-│   └── test_search.py          # 网络搜索接口测试
-│
-├── notebooks/                  # Jupyter 笔记本
-│   └── api_key.ipynb           # API Key 管理
-│
-├── web/                        # HTML 可视化页面
-│   ├── index.html
-│   ├── runnable_branch_visual.html
-│   └── 重大隐患练习.html
-│
-├── assets/                     # 静态资源文件
-│   └── sample.docx
-│
-├── docs/                       # 文档资料
-│   └── test.pdf
-│
-├── data/                       # 本地数据
-│   └── milvus_demo.db/         # Milvus Lite 向量数据库
-│
-└── output/                     # 运行输出（PDF 解析结果等）
-```
-
----
+这个项目用 FastAPI 提供聊天接口，使用 LangChain Agent 回答问题，并通过 Milvus 保存和召回长期记忆。API 的聊天日志存放在 PostgreSQL；会话 checkpoint 也使用 PostgreSQL，以便同一会话在服务重启后继续。
 
 ## 快速开始
 
+从项目根目录运行。建议使用 Python 3.12；先准备 PostgreSQL、Milvus（默认 `localhost:19530`）以及本地嵌入模型 `~/models/bge-base-zh-v1.5`。当前工具模块在导入时会连接 Milvus 并加载嵌入模型，因此这些依赖不可用时，API 可能无法启动。
+
 ```bash
-# 激活虚拟环境
+python3.12 -m venv .venv
 source .venv/bin/activate
-
-# 运行 Agent 主程序
-python src/agent/main.py
-
-# 初始化 Milvus 数据库
-python scripts/milvus/create_db.py
-
-# 插入文档数据
-python scripts/milvus/insert_db.py
-
-# 向量搜索
-python scripts/milvus/search_db.py
+python -m pip install -r requirements.txt
 ```
 
----
+在项目根目录创建 `.env`，至少配置以下项目。`DATABASE_URL` 是 SQLAlchemy 使用的 asyncpg URL；[checkpoint.py](src/agent/checkpoint.py) 会将它转换为 psycopg 可用的连接串，复用同一个 PostgreSQL 数据库。数据库账号须有首次创建 checkpoint 表的权限。不要将真实密钥提交到 Git。
 
-## 环境变量
-
-在 `.env` 中配置以下变量：
-
-```
+```dotenv
+DATABASE_URL=postgresql+asyncpg://agent:your_password@localhost:5432/agent
 OPENAI_API_KEY=your_key
-OPENAI_API_BASE_URL=https://...
-OPENAI_MODEL=qwen-plus
-GEMINI_API_KEY=your_key
-GEMINI_MODEL=gemini-2.0-flash
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
+OPENAI_BASE_URL=https://your-model-api.example/v1
+OPENAI_MODEL=your_model
 ```
 
-freeze > requirements.txt
+启动 API：
+
+```bash
+python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
+```
+
+首次启动会初始化 API 使用的 SQLAlchemy 表和 LangGraph checkpoint 表；初始化过程由 PostgreSQL advisory lock 串行化，避免多个 API worker 同时执行迁移。检查数据库连接，再发送聊天请求：
+
+```bash
+curl http://127.0.0.1:8000/health
+
+curl -X POST http://127.0.0.1:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"demo-user","session_id":"demo-session","message":"你好"}'
+```
+
+`/chat` 返回 `{"answer":"..."}`。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担恢复 Agent 状态的工作。
+
+`/chat` 在调用 Agent 前为当前用户/会话获取 PostgreSQL 事务级 advisory lock，并持有到 `ChatLog` 提交；同一会话的并发请求由数据库串行化，跨 API worker 也共享此约束。不同会话使用不同锁键，可并行处理。
+
+## 验证会话恢复与隔离
+
+1. 用用户 A、会话 S 连续发送两条相关消息，确认第二条能利用第一条的上下文。
+2. 重启 API，再用用户 A、会话 S 追问，确认仍能接续；在 PostgreSQL 中确认已建立 checkpoint 表。
+3. 用用户 B、会话 S 发送相同追问，以及用用户 A、会话 T 发送相同追问，确认都不会读到 A/S 的短期会话内容。
+
+测试时选择临时对话内容，避免长期记忆自动保存或召回影响对 checkpoint 隔离的判断。离线回归可运行：
+
+```bash
+python -m unittest discover -s tests -p 'test_checkpoint_flow.py'
+python -m unittest discover -s tests -p 'test_memory_update.py'
+```
+
+现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面两条定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
+
+目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
+
+## 当前边界
+
+- 请求体中的 `user_id` 尚未通过身份认证。复合会话 ID 能防止不同用户意外共用同一 checkpoint，但调用方仍可伪造他人的 `user_id`；对外提供服务前，需要从可信认证上下文获取身份，并校验会话归属。
+- 旧版 `InMemorySaver` 中的历史不会自动迁移到 PostgreSQL；新部署从新的 checkpoint 开始。
+- 当前 `/chat` 用 PostgreSQL advisory lock 串行化同一会话；锁等待超时、高并发延迟和多进程效果仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
+- `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/chat` 的验收结果。
+
+## 项目文档
+
+- [问题与改进 TODO](docs/TODO.md)：问题状态、验收条件和后续工作。
+- [自动召回学习文档](docs/auto_recall.md)：长期记忆读取、向量检索与 Graph 改造。
+- [学习进度路线](docs/learning_progress_roadmap.md) 与 [Agent 学习路线](docs/agent_learning_roadmap.md)：分阶段学习计划。
+
+主要代码入口为 [API](api/server.py)、[Agent](src/agent/main.py)、[记忆工具](src/agent/tools.py) 和 [独立 Graph 示例](src/agent/graph.py)。
