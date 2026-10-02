@@ -52,9 +52,10 @@ curl -X POST http://127.0.0.1:8000/chat \
 ```bash
 python -m unittest discover -s tests -p 'test_checkpoint_flow.py'
 python -m unittest discover -s tests -p 'test_memory_update.py'
+python -m unittest discover -s tests -p 'test_recall_routing.py'
 ```
 
-现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面两条定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
+现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面三条定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
 
 目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
 

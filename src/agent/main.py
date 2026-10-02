@@ -102,8 +102,8 @@ print("candidate_llm==========", candidate_llm)
 print("resolution_llm==========", resolution_llm)
 
 
-def route_memory_keys_with_llm(message: str) -> list[str]:
-    """规则判断不了时，让 LLM 路由"""
+def route_memory_keys_with_llm(message: str) -> MemoryRecallDecision:
+    """让 LLM 区分无需召回和需要召回但没有对应类别。"""
     prompt = f"""
 你负责判断回答当前用户问题需要读取哪些长期记忆。
 
@@ -139,21 +139,31 @@ food_preference
 should_recall=false
 memory_keys=[]
 
+5. 如果需要长期记忆，但无法确定上述类别：
+should_recall=true
+memory_keys=[]
+
 用户问题：
 
 {message}
 """
 
-    result = recall_llm.invoke(prompt)
-
-    if not result.should_recall:
-        return []
-
-    return result.memory_keys
+    return recall_llm.invoke(prompt)
 
 
 def should_recall_memory(message: str) -> bool:
     """判断“需不需要历史记忆”"""
+    # 直接询问过去对话时，即使没有命中具体记忆主题，也交给 LLM 判断。
+    explicit_history_phrases = (
+        "记得我",
+        "我之前说过",
+        "我以前说过",
+        "之前我说过",
+        "以前我说过",
+    )
+    if any(phrase in message for phrase in explicit_history_phrases):
+        return True
+
     personal_keywords = [
         "我",
         "我的",
@@ -195,33 +205,30 @@ def should_recall_memory(message: str) -> bool:
 
 
 def route_memory_keys(message: str) -> list[str]:
-    """用规则判断需要哪个记忆槽位"""
-    keys = set()
+    """只对明确询问本人事实的完整句式使用免模型精确路由。"""
+    question = message.strip().rstrip("？?。.!！").strip()
 
-    current_job_words = [
-        "职业是什么",
-        "做什么工作",
-        "现在做什么",
-        "目前做什么",
-        "干什么工作的",
-    ]
+    if question in {
+        "我的职业是什么",
+        "我现在的职业是什么",
+        "我目前的职业是什么",
+        "我现在做什么工作",
+        "我目前做什么工作",
+        "我现在的工作是什么",
+        "我目前的工作是什么",
+    }:
+        return ["current_job"]
 
-    career_direction_words = [
-        "职业方向",
-        "发展方向",
-        "职业规划",
-        "未来方向",
-        "转型方向",
-        "以后做什么",
-    ]
+    if question in {
+        "我的职业方向是什么",
+        "我未来的职业方向是什么",
+        "我的发展方向是什么",
+        "我未来的发展方向是什么",
+        "我的职业规划是什么",
+    }:
+        return ["career_direction"]
 
-    if any(word in message for word in current_job_words):
-        keys.add("current_job")
-
-    if any(word in message for word in career_direction_words):
-        keys.add("career_direction")
-
-    return list(keys)
+    return []
 
 
 def judge_memory(message: str) -> MemoryCandidate:
@@ -368,22 +375,21 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
     # 1. Memory Router
     # =========================
 
-    memory_keys = route_memory_keys(message)
+    memory_keys: list[str] = []
     recall_source = "none"
 
-    # 判断是否需要召回
+    # 门控没有命中时，不做回答前召回；回答后仍可读取旧记忆用于更新判断。
     need_recall = should_recall_memory(message)
 
-    # 规则命中
-    if memory_keys:
-        recall_source = "rule"
-
-    # 规则没命中，再让 LLM Router 判断
-    elif need_recall:
-        memory_keys = route_memory_keys_with_llm(message)
-
+    if need_recall:
+        memory_keys = route_memory_keys(message)
         if memory_keys:
-            recall_source = "llm"
+            recall_source = "rule"
+        else:
+            decision = route_memory_keys_with_llm(message)
+            if decision.should_recall:
+                memory_keys = list(dict.fromkeys(decision.memory_keys))
+                recall_source = "llm" if memory_keys else "vector"
 
     # =========================
     # 2. 内部统一读取方法
@@ -431,13 +437,11 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
     recalled_memories = []
 
     # 已经知道 key：精确查询
-    if memory_keys:
+    if recall_source in ("rule", "llm"):
         recalled_memories = get_memories(memory_keys)
 
-    # 不知道 key：向量召回兜底
-    elif need_recall:
-        recall_source = "vector"
-
+    # LLM 确认需要历史信息但不能确定类别时，才做向量兜底。
+    elif recall_source == "vector":
         recalled_memories = _recall_memories(
             user_id=user_id,
             query=message,

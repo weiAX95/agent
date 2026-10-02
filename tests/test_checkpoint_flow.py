@@ -102,7 +102,9 @@ class ChatCheckpointTests(unittest.TestCase):
             "datetime": datetime,
             "make_thread_id": make_thread_id,
             "route_memory_keys": lambda message: [],
-            "route_memory_keys_with_llm": lambda message: [],
+            "route_memory_keys_with_llm": lambda message: SimpleNamespace(
+                should_recall=True, memory_keys=[]
+            ),
             "should_recall_memory": lambda message: False,
             "_get_memories_by_keys": lambda **kwargs: [],
             "_recall_memories": lambda **kwargs: [],
@@ -143,6 +145,7 @@ class ChatCheckpointTests(unittest.TestCase):
         self.assertEqual(len(set(thread_ids)), 3)
 
     def test_recalled_memory_stays_in_context_outside_checkpoint_messages(self):
+        self.namespace["should_recall_memory"] = lambda message: True
         self.namespace["route_memory_keys"] = lambda message: ["current_job"]
         self.namespace["_get_memories_by_keys"] = lambda **kwargs: [
             {"memory_key": "current_job", "memory": "用户是软件工程师"}

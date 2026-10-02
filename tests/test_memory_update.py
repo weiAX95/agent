@@ -124,7 +124,9 @@ class MemoryUpdateTests(unittest.TestCase):
             "_recall_memories": lambda **kwargs: [],
             "replace_memory": self.tools["replace_memory"],
             "route_memory_keys": lambda message: [],
-            "route_memory_keys_with_llm": lambda message: [],
+            "route_memory_keys_with_llm": lambda message: SimpleNamespace(
+                should_recall=True, memory_keys=[]
+            ),
             "should_recall_memory": lambda message: False,
             "make_thread_id": lambda user_id, session_id: f"{user_id}:{session_id}",
         }
