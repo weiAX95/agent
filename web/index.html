@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Project Demos</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .header {
+            background: #1e293b;
+            padding: 16px 24px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 20px; color: #f8fafc; }
+        .header .subtitle { font-size: 13px; color: #94a3b8; margin-top: 2px; }
+        .main {
+            display: flex;
+            height: calc(100vh - 70px);
+        }
+        .sidebar {
+            width: 320px;
+            background: #1e293b;
+            border-right: 1px solid #334155;
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .file-item {
+            padding: 14px 16px;
+            margin-bottom: 8px;
+            background: #334155;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 2px solid transparent;
+        }
+        .file-item:hover {
+            background: #475569;
+            transform: translateX(4px);
+        }
+        .file-item.active {
+            border-color: #667eea;
+            background: #3b4a7c;
+        }
+        .file-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: #f8fafc;
+            margin-bottom: 4px;
+        }
+        .file-desc {
+            font-size: 12px;
+            color: #94a3b8;
+            line-height: 1.4;
+        }
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .toolbar {
+            background: #1e293b;
+            padding: 12px 20px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+        .toolbar .filename {
+            font-size: 15px;
+            color: #f8fafc;
+            font-weight: 600;
+            margin-right: auto;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        .btn-primary:hover { background: #5a67d8; }
+        .btn-secondary {
+            background: #334155;
+            color: #e2e8f0;
+        }
+        .btn-secondary:hover { background: #475569; }
+        .code-container {
+            flex: 1;
+            overflow: auto;
+            background: #282c34;
+        }
+        pre {
+            margin: 0;
+            min-height: 100%;
+        }
+        pre code {
+            font-family: "SF Mono", Monaco, "Cascadia Code", "Fira Code", monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        .empty-state {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #64748b;
+        }
+        .empty-state h2 {
+            font-size: 24px;
+            margin-bottom: 12px;
+            color: #94a3b8;
+        }
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 12px 20px;
+            background: #48bb78;
+            color: white;
+            border-radius: 8px;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+        .toast.show { opacity: 1; }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            margin-left: 8px;
+            font-weight: 500;
+        }
+        .badge-py { background: #3b82f6; color: white; }
+        .badge-html { background: #e34c26; color: white; }
+        .meta-info {
+            padding: 12px 20px;
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+            font-size: 13px;
+            color: #94a3b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>Agent Project Demos</h1>
+            <div class="subtitle">可视化浏览所有 Python / HTML Demo 文件</div>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="sidebar" id="sidebar">
+            <!-- 文件列表由 JS 动态生成 -->
+        </div>
+
+        <div class="content">
+            <div class="toolbar" id="toolbar" style="display: none;">
+                <span class="filename" id="currentFilename"></span>
+                <button class="btn btn-secondary" onclick="copyCode()">复制代码</button>
+                <button class="btn btn-primary" onclick="copyRunCommand()">复制运行命令</button>
+            </div>
+            <div class="meta-info" id="metaInfo" style="display: none;"></div>
+            <div class="code-container" id="codeContainer">
+                <div class="empty-state">
+                    <h2>👈 请选择左侧文件</h2>
+                    <p>点击文件即可查看源码</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast">已复制到剪贴板</div>
+
+    <script>
+        // Demo 文件配置
+        const files = [
+            {
+                name: "batch_demo.py",
+                type: "python",
+                desc: "批次调用 vs 非批次调用：同步逐个、asyncio 并发、OpenAI Batch API",
+                run: "/usr/bin/python3 batch_demo.py"
+            },
+            {
+                name: "prompt_template_demo.py",
+                type: "python",
+                desc: "Prompt Template 使用：f-string、Jinja2、LangChain PromptTemplate",
+                run: "/usr/bin/python3 prompt_template_demo.py"
+            },
+            {
+                name: "runnable_branch_demo.py",
+                type: "python",
+                desc: "RunnableBranch 条件分支：基础分支、LLM 路由、Agent 意图识别",
+                run: "/usr/bin/python3 runnable_branch_demo.py"
+            },
+            {
+                name: "test_gemini.py",
+                type: "python",
+                desc: "Gemini API 测试：列出模型并发送对话测试",
+                run: "GEMINI_API_KEY=xxx python3 test_gemini.py"
+            },
+            {
+                name: "crypto_trading_bot.py",
+                type: "python",
+                desc: "比特币 AI 合约交易机器人：AI 分析 + 币安自动下单（默认模拟交易）",
+                run: "/usr/bin/python3 crypto_trading_bot.py"
+            },
+            {
+                name: "runnable_branch_visual.html",
+                type: "html",
+                desc: "RunnableBranch 交互式可视化页面：输入问题看分支路由",
+                run: "浏览器打开 runnable_branch_visual.html"
+            },
+            {
+                name: "apiKey.ipynb",
+                type: "python",
+                desc: "原有 Notebook：API Key 与 OpenAI 客户端初始化示例",
+                run: "Jupyter Notebook 中打开 apiKey.ipynb"
+            }
+        ];
+
+        let currentFile = null;
+        let currentCode = "";
+
+        function initSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            files.forEach(file => {
+                const item = document.createElement('div');
+                item.className = 'file-item';
+                item.onclick = () => loadFile(file);
+                item.innerHTML = `
+                    <div class="file-name">
+                        ${file.name}
+                        <span class="badge badge-${file.type === 'python' ? 'py' : 'html'}">${file.type.toUpperCase()}</span>
+                    </div>
+                    <div class="file-desc">${file.desc}</div>
+                `;
+                sidebar.appendChild(item);
+            });
+        }
+
+        async function loadFile(file) {
+            currentFile = file;
+
+            // 更新激活状态
+            document.querySelectorAll('.file-item').forEach((el, idx) => {
+                el.classList.toggle('active', files[idx].name === file.name);
+            });
+
+            try {
+                const response = await fetch(file.name);
+                currentCode = await response.text();
+
+                document.getElementById('toolbar').style.display = 'flex';
+                document.getElementById('currentFilename').textContent = file.name;
+                document.getElementById('metaInfo').style.display = 'block';
+                document.getElementById('metaInfo').textContent = `描述：${file.desc} | 运行：${file.run}`;
+
+                const container = document.getElementById('codeContainer');
+                container.innerHTML = `<pre><code class="language-${file.type === 'python' ? 'python' : 'html'}">${escapeHtml(currentCode)}</code></pre>`;
+                hljs.highlightAll();
+            } catch (err) {
+                showToast('加载失败：' + err.message);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function copyCode() {
+            navigator.clipboard.writeText(currentCode).then(() => showToast('代码已复制'));
+        }
+
+        function copyRunCommand() {
+            if (currentFile) {
+                navigator.clipboard.writeText(currentFile.run).then(() => showToast('运行命令已复制'));
+            }
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 2000);
+        }
+
+        // 初始化
+        initSidebar();
+    </script>
+</body>
+</html>

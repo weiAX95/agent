@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量（包含敏感 API Key，切勿提交）
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+# 本地实验笔记包含实际密钥及运行输出，不上传
+notebooks/api_key.ipynb
+
+# 本地测试材料可能包含文档元数据，不作为源码上传
+assets/sample.docx
+docs/test.pdf
+
+# 向量数据库（本地数据，按需提交）
+data/milvus_demo.db/
+
+# 输出目录
+output/
+output_test/
+tmp/
+
+# macOS
+.DS_Store
+
+# 日志
+*.log

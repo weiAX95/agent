@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RunnableBranch 可视化</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 10px;
+            color: #1a1a2e;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+        }
+        .input-section {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            margin-bottom: 30px;
+        }
+        .input-group {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        button {
+            padding: 12px 28px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #5a67d8;
+        }
+        .examples {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .example-chip {
+            padding: 6px 14px;
+            background: #eef2ff;
+            color: #667eea;
+            border-radius: 20px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .example-chip:hover {
+            background: #dbe4ff;
+        }
+        .visualization {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+        .tree {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 24px;
+        }
+        .node {
+            padding: 16px 24px;
+            border-radius: 10px;
+            text-align: center;
+            min-width: 180px;
+            transition: all 0.3s ease;
+            border: 2px solid #e0e0e0;
+            background: #fafafa;
+        }
+        .node.active {
+            border-color: #667eea;
+            background: #eef2ff;
+            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.15);
+            transform: scale(1.03);
+        }
+        .node.executed {
+            border-color: #48bb78;
+            background: #f0fff4;
+        }
+        .node-label {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .node-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+        }
+        .node-detail {
+            font-size: 13px;
+            color: #666;
+            margin-top: 6px;
+        }
+        .branches {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            flex-wrap: wrap;
+            width: 100%;
+        }
+        .branch {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            flex: 1;
+            min-width: 160px;
+            max-width: 220px;
+        }
+        .arrow {
+            width: 2px;
+            height: 24px;
+            background: #e0e0e0;
+            position: relative;
+            transition: background 0.3s;
+        }
+        .arrow.active {
+            background: #667eea;
+        }
+        .arrow::after {
+            content: "";
+            position: absolute;
+            bottom: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-top: 8px solid #e0e0e0;
+            transition: border-top-color 0.3s;
+        }
+        .arrow.active::after {
+            border-top-color: #667eea;
+        }
+        .condition-badge {
+            font-size: 12px;
+            padding: 4px 10px;
+            background: #fff3e0;
+            color: #e65100;
+            border-radius: 12px;
+            margin-top: 6px;
+        }
+        .result-panel {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+        .result-panel h3 {
+            margin-bottom: 12px;
+            color: #1a1a2e;
+        }
+        .result-item {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .result-item strong {
+            color: #667eea;
+        }
+        .log {
+            margin-top: 20px;
+            padding: 16px;
+            background: #1a1a2e;
+            color: #00ff88;
+            border-radius: 8px;
+            font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+            font-size: 13px;
+            min-height: 80px;
+            white-space: pre-wrap;
+        }
+        .legend {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 20px;
+            font-size: 13px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .legend-box {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 2px solid;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>RunnableBranch 可视化</h1>
+        <p class="subtitle">输入问题，观察 LangChain 的 RunnableBranch 如何按条件路由</p>
+
+        <div class="input-section">
+            <div class="input-group">
+                <input type="text" id="userInput" placeholder="输入你的问题，例如：搜索一下最近的 AI 新闻" />
+                <button onclick="runBranch()">执行分支</button>
+            </div>
+            <div class="examples">
+                <span class="example-chip" onclick="setExample('你好，帮我个忙')">问候</span>
+                <span class="example-chip" onclick="setExample('计算 23 + 45 等于多少')">数学</span>
+                <span class="example-chip" onclick="setExample('搜索一下最近的 AI 新闻')">搜索</span>
+                <span class="example-chip" onclick="setExample('北京今天天气怎么样')">天气</span>
+                <span class="example-chip" onclick="setExample('讲一个笑话')">默认</span>
+            </div>
+        </div>
+
+        <div class="visualization">
+            <div class="tree">
+                <div class="node" id="inputNode">
+                    <div class="node-label">Input</div>
+                    <div class="node-title">用户输入</div>
+                    <div class="node-detail" id="inputDetail">等待输入...</div>
+                </div>
+
+                <div class="arrow" id="arrowToClassifier"></div>
+
+                <div class="node" id="classifierNode">
+                    <div class="node-label">Classifier</div>
+                    <div class="node-title">意图识别</div>
+                    <div class="node-detail" id="classifierDetail">规则分类</div>
+                </div>
+
+                <div class="arrow" id="arrowToBranches"></div>
+
+                <div class="branches">
+                    <div class="branch">
+                        <div class="node" id="searchNode">
+                            <div class="node-label">Branch 1</div>
+                            <div class="node-title">搜索工具</div>
+                            <div class="condition-badge">含"搜索/查一下"</div>
+                        </div>
+                    </div>
+                    <div class="branch">
+                        <div class="node" id="calcNode">
+                            <div class="node-label">Branch 2</div>
+                            <div class="node-title">计算工具</div>
+                            <div class="condition-badge">含"计算/等于/+"</div>
+                        </div>
+                    </div>
+                    <div class="branch">
+                        <div class="node" id="weatherNode">
+                            <div class="node-label">Branch 3</div>
+                            <div class="node-title">天气工具</div>
+                            <div class="condition-badge">含"天气/气温"</div>
+                        </div>
+                    </div>
+                    <div class="branch">
+                        <div class="node" id="defaultNode">
+                            <div class="node-label">Default</div>
+                            <div class="node-title">直接回答</div>
+                            <div class="condition-badge">未命中任何分支</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="arrow" id="arrowToOutput"></div>
+
+                <div class="node" id="outputNode">
+                    <div class="node-label">Output</div>
+                    <div class="node-title">执行结果</div>
+                    <div class="node-detail" id="outputDetail">等待执行...</div>
+                </div>
+            </div>
+
+            <div class="result-panel">
+                <h3>执行详情</h3>
+                <div class="result-item"><strong>匹配分支：</strong><span id="matchedBranch">-</span></div>
+                <div class="result-item"><strong>调用工具：</strong><span id="toolCalled">-</span></div>
+                <div class="result-item"><strong>返回结果：</strong><span id="toolResult">-</span></div>
+            </div>
+
+            <div class="log" id="executionLog">// 执行日志将显示在这里</div>
+
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-box" style="border-color: #667eea; background: #eef2ff;"></div>
+                    <span>当前激活路径</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-box" style="border-color: #48bb78; background: #f0fff4;"></div>
+                    <span>已执行节点</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-box" style="border-color: #e0e0e0; background: #fafafa;"></div>
+                    <span>未激活节点</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function setExample(text) {
+            document.getElementById('userInput').value = text;
+        }
+
+        function classifyIntent(query) {
+            const keywords = {
+                search: ['搜索', '查一下', '最新', '查询'],
+                calculator: ['计算', '等于', '+', '-', '*', '/', '多少'],
+                weather: ['天气', '气温', '下雨', '晴']
+            };
+
+            if (keywords.search.some(k => query.includes(k))) return 'search';
+            if (keywords.calculator.some(k => query.includes(k))) return 'calculator';
+            if (keywords.weather.some(k => query.includes(k))) return 'weather';
+            return 'direct';
+        }
+
+        function resetVisualization() {
+            document.querySelectorAll('.node').forEach(n => {
+                n.classList.remove('active', 'executed');
+            });
+            document.querySelectorAll('.arrow').forEach(a => {
+                a.classList.remove('active');
+            });
+        }
+
+        async function activateNode(id, delay = 300) {
+            const node = document.getElementById(id);
+            node.classList.add('active');
+            await sleep(delay);
+            node.classList.remove('active');
+            node.classList.add('executed');
+        }
+
+        async function activateArrow(id, delay = 300) {
+            const arrow = document.getElementById(id);
+            arrow.classList.add('active');
+            await sleep(delay);
+            arrow.classList.add('active');
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function runBranch() {
+            const query = document.getElementById('userInput').value.trim();
+            if (!query) {
+                alert('请先输入一个问题');
+                return;
+            }
+
+            resetVisualization();
+
+            const logEl = document.getElementById('executionLog');
+            logEl.textContent = `// 开始执行 RunnableBranch\n// 输入: "${query}"\n`;
+
+            // Step 1: Input
+            document.getElementById('inputDetail').textContent = query;
+            await activateNode('inputNode');
+            logEl.textContent += `→ 接收到输入: "${query}"\n`;
+
+            // Step 2: Arrow to classifier
+            await activateArrow('arrowToClassifier');
+
+            // Step 3: Classifier
+            const intent = classifyIntent(query);
+            document.getElementById('classifierDetail').textContent = `识别意图: ${intent}`;
+            await activateNode('classifierNode');
+            logEl.textContent += `→ 意图识别结果: ${intent}\n`;
+
+            // Step 4: Arrow to branches
+            await activateArrow('arrowToBranches');
+
+            // Step 5: Branch routing
+            const branchMap = {
+                search: { node: 'searchNode', name: '搜索工具', tool: 'search', result: `搜索结果："${query}" 的最新信息` },
+                calculator: { node: 'calcNode', name: '计算工具', tool: 'calculator', result: '计算结果：42（模拟结果）' },
+                weather: { node: 'weatherNode', name: '天气工具', tool: 'weather', result: '北京今天晴，25°C（模拟结果）' },
+                direct: { node: 'defaultNode', name: '直接回答', tool: 'direct_answer', result: '我会直接回答你的问题。' }
+            };
+
+            const selected = branchMap[intent];
+            await activateNode(selected.node);
+            logEl.textContent += `→ 命中分支: ${selected.name}\n`;
+            logEl.textContent += `→ 调用工具: ${selected.tool}\n`;
+
+            // Step 6: Arrow to output
+            await activateArrow('arrowToOutput');
+
+            // Step 7: Output
+            document.getElementById('outputDetail').textContent = selected.result;
+            await activateNode('outputNode');
+            logEl.textContent += `→ 返回结果: ${selected.result}\n`;
+            logEl.textContent += `// RunnableBranch 执行完成`;
+
+            // Update result panel
+            document.getElementById('matchedBranch').textContent = selected.name;
+            document.getElementById('toolCalled').textContent = selected.tool;
+            document.getElementById('toolResult').textContent = selected.result;
+        }
+
+        // 支持回车执行
+        document.getElementById('userInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                runBranch();
+            }
+        });
+    </script>
+</body>
+</html>
