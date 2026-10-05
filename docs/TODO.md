@@ -195,8 +195,8 @@
 
 - [ ] 完成聊天接口的端到端验收。
 - **原计划**：“添加 POST /chat 接口，接收 message + session_id，返回 answer”。
-- **当前状态：已有实现**。[server.py](../api/server.py) 已声明接口，实际请求还要求 `user_id`，返回 `answer`。
-- **下一步 / 验收**：修复启动和身份隔离，明确身份来源；验证有效请求、缺失字段及异常响应；客户端示例与请求结构一致。
+- **当前状态：已有实现**。[server.py](../api/server.py) 以 SSE 返回 `token`、`usage`、`done` 或 `error` 事件；`usage` 仅展示供应商提供的真实 token 统计。实际请求还要求 `user_id`；前端用 `fetch` 读取 POST SSE 流，并在页面会话内累计用量。
+- **下一步 / 验收**：修复启动和身份隔离，明确身份来源；验证有效请求、缺失字段、流中异常和断开连接；客户端示例与事件格式一致。
 
 ### PLAN-04 · P2 · 暂存会话并迁移 checkpointer
 

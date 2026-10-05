@@ -29,6 +29,8 @@ def load_routing(namespace):
         "should_recall_memory",
         "route_memory_keys",
         "route_memory_keys_with_llm",
+        "_prepare_chat",
+        "_update_long_term_memory",
         "chat",
     }
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -70,6 +72,7 @@ class RecallRoutingTests(unittest.TestCase):
             "_get_memories_by_keys": self.exact_query,
             "_recall_memories": self.vector_query,
             "judge_memory": lambda message: SimpleNamespace(memories=[]),
+            "should_extract_memory": lambda message: False,
             "make_thread_id": lambda user_id, session_id: "offline-thread",
         }
         load_routing(self.namespace)

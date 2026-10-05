@@ -1,12 +1,18 @@
+import asyncio
 import datetime
+import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Literal, TypeAlias
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRequest, dynamic_prompt
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -92,17 +98,33 @@ class MemoryRecallDecision(BaseModel):
     memory_keys: list[MemoryKey]
 
 
-candidate_llm = llm.with_structured_output(MemoryCandidate)
+def _memory_decision_model(schema: type[BaseModel]):
+    """Parse decision data from normal text, including Markdown JSON blocks."""
+    instructions = (
+        "\n\n请根据以下字段定义提供决策数据，可以放在 Markdown 的 ```json 代码块中。"
+        "代码块外可以有简短说明。\n字段定义：\n"
+        + json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    )
 
-resolution_llm = llm.with_structured_output(MemoryResolutionBatch)
+    def add_schema(prompt):
+        if isinstance(prompt, str):
+            return prompt + instructions
+        return [*prompt, HumanMessage(content=instructions)]
 
-recall_llm = llm.with_structured_output(MemoryRecallDecision)
+    return RunnableLambda(add_schema) | llm | PydanticOutputParser(pydantic_object=schema)
+
+
+candidate_llm = _memory_decision_model(MemoryCandidate)
+resolution_llm = _memory_decision_model(MemoryResolutionBatch)
+recall_llm = _memory_decision_model(MemoryRecallDecision)
 
 print("candidate_llm==========", candidate_llm)
 print("resolution_llm==========", resolution_llm)
 
 
-def route_memory_keys_with_llm(message: str) -> MemoryRecallDecision:
+def route_memory_keys_with_llm(
+    message: str, callbacks: list | None = None
+) -> MemoryRecallDecision:
     """让 LLM 区分无需召回和需要召回但没有对应类别。"""
     prompt = f"""
 你负责判断回答当前用户问题需要读取哪些长期记忆。
@@ -148,7 +170,8 @@ memory_keys=[]
 {message}
 """
 
-    return recall_llm.invoke(prompt)
+    config = {"callbacks": callbacks} if callbacks else None
+    return recall_llm.invoke(prompt, config=config)
 
 
 def should_recall_memory(message: str) -> bool:
@@ -231,7 +254,29 @@ def route_memory_keys(message: str) -> list[str]:
     return []
 
 
-def judge_memory(message: str) -> MemoryCandidate:
+def should_extract_memory(message: str) -> bool:
+    """Skip the extra extraction model call unless text looks like a durable fact."""
+    text = message.strip()
+    if not text or text.endswith(("?", "？", "吗", "吗？")):
+        return False
+
+    personal_assertions = (
+        "我是", "我目前", "我现在", "我从事", "我负责", "我正在", "我计划",
+        "我打算", "我希望长期", "我的目标", "我的计划", "我的项目", "我喜欢",
+        "我不喜欢", "我偏好", "我习惯", "我不吃", "我对",
+    )
+    durable_topics = (
+        "工作", "职业", "岗位", "方向", "目标", "计划", "项目", "学习",
+        "技术栈", "偏好", "喜欢", "习惯", "饮食", "过敏", "咖啡", "茶",
+        "程序员", "工程师", "开发", "教师", "老师", "设计师", "医生",
+        "产品经理", "自由职业", "全职", "兼职",
+    )
+    return any(marker in text for marker in personal_assertions) and any(
+        topic in text for topic in durable_topics
+    )
+
+
+def judge_memory(message: str, callbacks: list | None = None) -> MemoryCandidate:
     """判断当前消息值不值得保存"""
 
     prompt = f"""
@@ -273,12 +318,14 @@ def judge_memory(message: str) -> MemoryCandidate:
     {message}
     """
 
-    return candidate_llm.invoke(prompt)
+    config = {"callbacks": callbacks} if callbacks else None
+    return candidate_llm.invoke(prompt, config=config)
 
 
 def resolve_memories(
     items: list[dict],
     user_message: str,
+    callbacks: list | None = None,
 ) -> MemoryResolutionBatch:
 
     prompt = f"""
@@ -317,7 +364,8 @@ memory 返回根据本轮消息整理的最终正确记忆，不能增加新事�
 只返回结构化结果。
 """
 
-    return resolution_llm.invoke(prompt)
+    config = {"callbacks": callbacks} if callbacks else None
+    return resolution_llm.invoke(prompt, config=config)
 
 
 def validate_memory_resolutions(
@@ -368,7 +416,9 @@ def debug_memory(session_id: str, user_id: str, agent):
             print(message.tool_calls)
 
 
-def chat(message: str, session_id: str, user_id: str, agent) -> str:
+def _prepare_chat(
+    message: str, session_id: str, user_id: str, agent, callbacks: list | None = None
+):
     memory_cache: dict[str, list[dict]] = {}
 
     # =========================
@@ -386,7 +436,7 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
         if memory_keys:
             recall_source = "rule"
         else:
-            decision = route_memory_keys_with_llm(message)
+            decision = route_memory_keys_with_llm(message, callbacks=callbacks)
             if decision.should_recall:
                 memory_keys = list(dict.fromkeys(decision.memory_keys))
                 recall_source = "llm" if memory_keys else "vector"
@@ -485,15 +535,32 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
             2. 长期记忆只是辅助上下文，不要强行套用。
             3. 如果当前用户明确表达的信息和长期记忆冲突，以当前消息为准。
             4. 不允许根据长期记忆推测用户没有明确表达的信息。
+
+            输出格式要求：
+            1. 需要分点或分节时，使用标准 Markdown；标题符号后必须有空格，
+               标题、段落和列表项各自换行。
+            2. 列表项每项单独一行；代码使用带语言标识的围栏代码块。
+            3. 中文直接输出，不要将中文转义为 HTML 数字实体（例如 &#x70ED;）。
             """
 
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": message}]},
-        config={"configurable": {"thread_id": make_thread_id(user_id, session_id)}},
-        context={"system_prompt": system_prompt},
-    )
+    agent_input = {"messages": [{"role": "user", "content": message}]}
+    agent_config = {
+        "configurable": {"thread_id": make_thread_id(user_id, session_id)}
+    }
+    agent_context = {"system_prompt": system_prompt}
 
-    candidate = judge_memory(message)
+    return memory_cache, get_memories, agent_input, agent_config, agent_context
+
+
+def _update_long_term_memory(
+    message: str, user_id: str, memory_cache, get_memories, callbacks=None
+) -> None:
+
+    if not should_extract_memory(message):
+        print("跳过长期记忆抽取：当前消息不像长期事实陈述")
+        return
+
+    candidate = judge_memory(message, callbacks=callbacks)
     candidate_by_key: dict[str, str] = {}
     for item in candidate.memories:
         if item.memory_key in candidate_by_key:
@@ -520,7 +587,7 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
     ]
     resolution_by_key = (
         validate_memory_resolutions(
-            resolve_memories(resolve_items, message), existing_by_key
+            resolve_memories(resolve_items, message, callbacks=callbacks), existing_by_key
         )
         if resolve_items
         else {}
@@ -548,4 +615,135 @@ def chat(message: str, session_id: str, user_id: str, agent) -> str:
         else:
             print("重复记忆，不保存:", key)
 
-    return result["messages"][-1].content
+    return None
+
+
+def chat(message: str, session_id: str, user_id: str, agent) -> str:
+    memory_cache, get_memories, agent_input, agent_config, agent_context = _prepare_chat(
+        message, session_id, user_id, agent
+    )
+    result = agent.invoke(agent_input, config=agent_config, context=agent_context)
+    answer = result["messages"][-1].content
+    _update_long_term_memory(message, user_id, memory_cache, get_memories)
+    return answer
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    return ""
+
+
+async def _restore_stopped_turn(agent, config, message_id: str, prompt: str, partial: str) -> None:
+    """Replace transient graph writes with one canonical, explicitly stopped turn."""
+    try:
+        state = await agent.aget_state(config)
+        messages = state.values.get("messages", [])
+        start = next(
+            (index for index, item in enumerate(messages) if item.id == message_id),
+            None,
+        )
+        if start is not None:
+            await agent.aupdate_state(
+                config,
+                {"messages": [RemoveMessage(id=item.id) for item in messages[start:]]},
+            )
+    except Exception:
+        # If no checkpoint was created, appending a canonical stopped turn is enough.
+        pass
+
+    stopped_answer = (partial or "") + "\n\n[本轮已停止生成]"
+    await agent.aupdate_state(
+        config,
+        {
+            "messages": [
+                HumanMessage(id=message_id, content=prompt),
+                AIMessage(content=stopped_answer),
+            ]
+        },
+    )
+
+
+async def chat_stream(
+    message: str, session_id: str, user_id: str, agent, on_token, callbacks=None
+) -> tuple[str, str]:
+    (
+        memory_cache,
+        get_memories,
+        agent_input,
+        agent_config,
+        agent_context,
+    ) = await asyncio.to_thread(
+        _prepare_chat, message, session_id, user_id, agent, callbacks
+    )
+    message_id = str(uuid.uuid4())
+    agent_input["messages"] = [HumanMessage(id=message_id, content=message)]
+    partial = ""
+
+    try:
+        async for part in agent.astream(
+            agent_input,
+            config=(
+                {**agent_config, "callbacks": callbacks}
+                if callbacks
+                else agent_config
+            ),
+            context=agent_context,
+            stream_mode=["messages", "updates"],
+            version="v2",
+        ):
+            if part["type"] == "messages":
+                chunk, metadata = part["data"]
+                if metadata.get("langgraph_node") == "model":
+                    token = _content_to_text(chunk.content)
+                    if token:
+                        partial += token
+                        await on_token(token)
+            elif part["type"] == "updates":
+                model_update = part["data"].get("model", {})
+                messages = model_update.get("messages", [])
+                if messages:
+                    answer = _content_to_text(messages[-1].content)
+                    if answer:
+                        partial = answer
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            _restore_stopped_turn(agent, agent_config, message_id, message, partial)
+        )
+        return "stopped", partial
+    except Exception:
+        await _discard_incomplete_turn(agent, agent_config, message_id)
+        raise
+
+    await asyncio.to_thread(
+        _update_long_term_memory,
+        message,
+        user_id,
+        memory_cache,
+        get_memories,
+        callbacks,
+    )
+    return "done", partial
+
+
+async def _discard_incomplete_turn(agent, config, message_id: str) -> None:
+    try:
+        state = await agent.aget_state(config)
+        messages = state.values.get("messages", [])
+        start = next(
+            (index for index, item in enumerate(messages) if item.id == message_id),
+            None,
+        )
+        if start is not None:
+            await agent.aupdate_state(
+                config,
+                {"messages": [RemoveMessage(id=item.id) for item in messages[start:]]},
+            )
+    except Exception:
+        pass

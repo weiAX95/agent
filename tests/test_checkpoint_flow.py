@@ -5,10 +5,12 @@ tests load only ``chat`` from it and supply a recording agent instead.
 """
 
 import ast
+import asyncio
 import contextlib
 import copy
 import datetime
 import io
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,7 +111,14 @@ class ChatCheckpointTests(unittest.TestCase):
             "_get_memories_by_keys": lambda **kwargs: [],
             "_recall_memories": lambda **kwargs: [],
             "judge_memory": lambda message: SimpleNamespace(memories=[]),
+            "should_extract_memory": lambda message: False,
         }
+        load_function(
+            ROOT / "src/agent/main.py", "_prepare_chat", self.namespace
+        )
+        load_function(
+            ROOT / "src/agent/main.py", "_update_long_term_memory", self.namespace
+        )
         self.chat = load_function(ROOT / "src/agent/main.py", "chat", self.namespace)
 
     def call_chat(self, user_id, session_id, message="你好"):
@@ -231,23 +240,31 @@ class ChatCheckpointTests(unittest.TestCase):
 
 
 class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_chat_endpoint_locks_before_threadpool_and_commits_after(self):
+    async def test_chat_endpoint_streams_and_commits_after_agent_completion(self):
         from src.agent.checkpoint import checkpoint_lock_id
+        from starlette.responses import StreamingResponse
 
         started_agent = object()
-        chat_calls = []
-        threadpool_calls = []
         events = []
+        chat_calls = []
 
-        def fake_chat(*args, **kwargs):
+        async def fake_chat_stream(*, message, user_id, session_id, agent, on_token, callbacks):
             events.append("chat")
-            chat_calls.append((args, kwargs))
-            return "回答"
+            chat_calls.append((message, user_id, session_id, agent, callbacks))
+            await on_token("一段")
+            return "done", "完整回答"
 
-        async def fake_run_in_threadpool(func, *args, **kwargs):
-            events.append("threadpool")
-            threadpool_calls.append(func)
-            return func(*args, **kwargs)
+        class FakeUsageCallback:
+            usage_metadata = {}
+
+        def fake_usage_payload(callback):
+            return {
+                "available": True,
+                "models": {"fake-model": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}},
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "total_tokens": 13,
+            }
 
         class FakeDB:
             def __init__(self):
@@ -269,10 +286,17 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
 
         app = SimpleNamespace(state=SimpleNamespace(agent=started_agent))
         namespace = {
-            "chat": fake_chat,
-            "run_in_threadpool": fake_run_in_threadpool,
+            "asyncio": asyncio,
+            "json": json,
+            "chat_stream": fake_chat_stream,
+            "UsageMetadataCallbackHandler": FakeUsageCallback,
+            "_usage_payload": fake_usage_payload,
+            "StreamingResponse": StreamingResponse,
             "Depends": lambda dependency: None,
             "get_db": lambda: None,
+            "Request": object,
+            "sys": __import__("sys"),
+            "logger": SimpleNamespace(exception=lambda *args, **kwargs: None),
             "ChatLog": lambda **values: SimpleNamespace(**values),
             "text": lambda statement: statement,
             "checkpoint_lock_id": checkpoint_lock_id,
@@ -285,21 +309,72 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             result = await endpoint(request, http_request, db)
 
-        self.assertEqual(result, {"answer": "回答"})
-        self.assertEqual(events, ["lock", "threadpool", "chat", "add_log", "commit"])
+        self.assertIsInstance(result, StreamingResponse)
+        frames = [frame async for frame in result.body_iterator]
+        body = "".join(
+            frame.decode() if isinstance(frame, bytes) else frame for frame in frames
+        )
+        self.assertIn('event: token\ndata: {"content": "一段"}', body)
+        self.assertIn('event: usage\ndata: {"available": true', body)
+        self.assertIn('event: done\ndata: {"answer": "完整回答"}', body)
+        self.assertEqual(events, ["lock", "chat", "add_log", "commit"])
         self.assertEqual(len(db.executions), 1)
         statement, params = db.executions[0]
         self.assertIn("pg_advisory_xact_lock", statement)
         self.assertEqual(params, {"lock_id": checkpoint_lock_id("alice", "s1")})
-        self.assertEqual(threadpool_calls, [fake_chat])
         self.assertEqual(len(chat_calls), 1)
-        args, kwargs = chat_calls[0]
-        self.assertIn(started_agent, (*args, *kwargs.values()))
+        self.assertEqual(chat_calls[0][:4], ("你好", "alice", "s1", started_agent))
         self.assertEqual(db.commits, 1)
         self.assertEqual(len(db.added), 1)
         self.assertEqual(db.added[0].user_id, "alice")
         self.assertEqual(db.added[0].session_id, "s1")
-        self.assertEqual(db.added[0].answer, "回答")
+        self.assertEqual(db.added[0].answer, "完整回答")
+
+
+class TokenUsagePayloadTests(unittest.TestCase):
+    def test_aggregates_reported_usage_and_marks_missing_usage(self):
+        payload_builder = load_function(
+            ROOT / "api/server.py", "_usage_payload", {}
+        )
+        callback = SimpleNamespace(
+            usage_metadata={
+                "model-a": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "total_tokens": 18,
+                    "input_token_details": {"cache_read": 5},
+                },
+                "model-b": {
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                },
+            }
+        )
+        self.assertEqual(
+            payload_builder(callback),
+            {
+                "available": True,
+                "models": {
+                    "model-a": {
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                    "model-b": {
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5,
+                    },
+                },
+                "input_tokens": 13,
+                "output_tokens": 10,
+                "total_tokens": 23,
+            },
+        )
+        self.assertFalse(
+            payload_builder(SimpleNamespace(usage_metadata={}))["available"]
+        )
 
 
 class LifespanTests(unittest.IsolatedAsyncioTestCase):
@@ -338,11 +413,11 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
                 configured.update(kwargs)
                 events.append("pool_create")
 
-            def open(self, *, wait):
+            async def open(self, *, wait):
                 self.wait = wait
                 events.append("pool_open")
 
-            def close(self):
+            async def close(self):
                 events.append("pool_close")
 
         class FakeSaver:
@@ -350,14 +425,10 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
                 self.pool = pool
                 events.append("saver_create")
 
-            def setup(self):
+            async def setup(self):
                 events.append("saver_setup")
                 if setup_fails:
                     raise RuntimeError("setup failed")
-
-        async def fake_run_in_threadpool(func, *args, **kwargs):
-            events.append(("threadpool", func.__name__))
-            return func(*args, **kwargs)
 
         def fake_build_agent(checkpointer):
             self.assertIsInstance(checkpointer, FakeSaver)
@@ -368,9 +439,8 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         namespace = {
             "engine": FakeEngine(),
             "Base": SimpleNamespace(metadata=SimpleNamespace(create_all=object())),
-            "ConnectionPool": FakePool,
-            "PostgresSaver": FakeSaver,
-            "run_in_threadpool": fake_run_in_threadpool,
+            "AsyncConnectionPool": FakePool,
+            "AsyncPostgresSaver": FakeSaver,
             "build_agent": fake_build_agent,
             "settings": SimpleNamespace(database_url="postgresql+asyncpg://u:p@h/db"),
             "checkpoint_dsn": lambda url: "postgresql://u:p@h/db",

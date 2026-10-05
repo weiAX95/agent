@@ -5,7 +5,6 @@ import json
 
 from sqlalchemy.engine import make_url
 
-
 CHECKPOINT_SETUP_LOCK_ID = int.from_bytes(
     hashlib.sha256(b"agent:checkpoint:schema").digest()[:8], "big", signed=True
 )

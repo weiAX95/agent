@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 
@@ -13,6 +14,7 @@ embed_model = HuggingFaceEmbeddings(model_name=model_path)
 client = MilvusClient(uri="http://localhost:19530")
 
 MEMORY_COLLECTION = "agent_memory"
+KNOWLEDGE_COLLECTION = "demo_collection"
 
 
 if not client.has_collection(MEMORY_COLLECTION):
@@ -119,12 +121,15 @@ URL：{item.get('url', '')}
 def search_knowledge_base(query: str) -> str:
     """在内部知识库中搜索相关信息"""
 
+    if not client.has_collection(KNOWLEDGE_COLLECTION):
+        return "内部知识库尚未初始化，无法提供知识库检索结果。"
+
     # 1. 把用户问题转换成向量
     query_vector = embed_model.embed_query(query)
 
     # 2. 去 Milvus 做向量搜索
     res = client.search(
-        collection_name=MEMORY_COLLECTION,
+        collection_name=KNOWLEDGE_COLLECTION,
         data=[query_vector],
         anns_field="vector",
         limit=5,
@@ -189,10 +194,12 @@ def _get_memories_by_keys(
     if not memory_keys:
         return []
 
+    # Encode literals because the deployed Milvus cannot parse filter templates.
+    user_literal = json.dumps(user_id, ensure_ascii=False)
+    keys_literal = json.dumps(list(dict.fromkeys(memory_keys)), ensure_ascii=False)
     records = client.query(
         collection_name=MEMORY_COLLECTION,
-        filter="user_id == {user_id} and memory_key in {memory_keys}",
-        filter_params={"user_id": user_id, "memory_keys": list(dict.fromkeys(memory_keys))},
+        filter=f"user_id == {user_literal} and memory_key in {keys_literal}",
         output_fields=[
             "id",
             "user_id",
@@ -262,7 +269,7 @@ def search_memory(user_id: str, query: str) -> str:
         collection_name=MEMORY_COLLECTION,
         data=[query_vector],
         limit=5,
-        filter=f'user_id == "{user_id}"',
+        filter=f"user_id == {json.dumps(user_id, ensure_ascii=False)}",
         output_fields=["user_id", "memory"],
     )
 
@@ -357,7 +364,7 @@ def _recall_memories(
         data=[query_vector],
         anns_field="vector",
         limit=limit,
-        filter=f'user_id == "{user_id}"',
+        filter=f"user_id == {json.dumps(user_id, ensure_ascii=False)}",
         output_fields=[
             "id",
             "user_id",

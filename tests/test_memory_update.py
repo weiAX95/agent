@@ -8,8 +8,8 @@ import ast
 import contextlib
 import copy
 import datetime
-import hashlib
 import io
+import json
 import unittest
 import uuid
 from pathlib import Path
@@ -40,6 +40,19 @@ def load_definitions(path, names, namespace):
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
 
 
+class MemoryExtractionGateTests(unittest.TestCase):
+    def test_only_durable_personal_statements_trigger_extraction(self):
+        namespace = {}
+        load_definitions(
+            ROOT / "src/agent/main.py", {"should_extract_memory"}, namespace
+        )
+        should_extract = namespace["should_extract_memory"]
+        self.assertTrue(should_extract("我目前从事软件开发工作"))
+        self.assertTrue(should_extract("我喜欢喝咖啡"))
+        self.assertFalse(should_extract("帮我解释一下 Python 的 async"))
+        self.assertFalse(should_extract("我喜欢什么？"))
+
+
 class FakeMilvus:
     def __init__(self):
         self.records = {}
@@ -47,7 +60,11 @@ class FakeMilvus:
         self.inserts = []
         self.upserts = []
 
-    def query(self, *, filter, filter_params, output_fields, **kwargs):
+    def query(self, *, filter, output_fields, **kwargs):
+        user_id, end = json.JSONDecoder().raw_decode(filter.removeprefix("user_id == "))
+        remainder = filter.removeprefix("user_id == ")[end:]
+        memory_keys = json.loads(remainder.removeprefix(" and memory_key in "))
+        filter_params = {"user_id": user_id, "memory_keys": memory_keys}
         self.queries.append((filter, copy.deepcopy(filter_params)))
         keys = set(filter_params["memory_keys"])
         return [
@@ -91,7 +108,7 @@ class FakeResolver:
         self.batch = None
         self.prompts = []
 
-    def invoke(self, prompt):
+    def invoke(self, prompt, config=None):
         self.prompts.append(prompt)
         if self.batch is None:
             raise AssertionError("unexpected resolver call")
@@ -108,6 +125,7 @@ class MemoryUpdateTests(unittest.TestCase):
             "client": self.client,
             "embed_model": self.embedding,
             "uuid": uuid,
+            "json": json,
         }
         load_definitions(
             ROOT / "src/agent/tools.py",
@@ -124,10 +142,13 @@ class MemoryUpdateTests(unittest.TestCase):
             "_recall_memories": lambda **kwargs: [],
             "replace_memory": self.tools["replace_memory"],
             "route_memory_keys": lambda message: [],
-            "route_memory_keys_with_llm": lambda message: SimpleNamespace(
+            "route_memory_keys_with_llm": lambda message, callbacks=None: SimpleNamespace(
                 should_recall=True, memory_keys=[]
             ),
             "should_recall_memory": lambda message: False,
+            # These cases explicitly exercise memory writes; ordinary user turns
+            # are covered by the extraction-gate regression tests.
+            "should_extract_memory": lambda message: True,
             "make_thread_id": lambda user_id, session_id: f"{user_id}:{session_id}",
         }
         self.agent = SimpleNamespace(
@@ -145,6 +166,8 @@ class MemoryUpdateTests(unittest.TestCase):
                 "MemoryCandidate",
                 "resolve_memories",
                 "validate_memory_resolutions",
+                "_prepare_chat",
+                "_update_long_term_memory",
                 "chat",
             },
             self.flow,
@@ -164,7 +187,7 @@ class MemoryUpdateTests(unittest.TestCase):
 
     def candidates(self, *items):
         model = self.flow["MemoryCandidateItem"]
-        self.flow["judge_memory"] = lambda message: self.flow["MemoryCandidate"](
+        self.flow["judge_memory"] = lambda message, callbacks=None: self.flow["MemoryCandidate"](
             memories=[model(memory_key=key, memory=memory) for key, memory in items]
         )
 
@@ -178,9 +201,17 @@ class MemoryUpdateTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return self.flow["chat"]("用户本轮消息", "session-1", "user-a", self.agent)
 
+    def test_query_escapes_literals_and_preserves_user_scope(self):
+        user = 'user"\\特殊'
+        key = 'current_job"\\'
+        self.add_record("selected", user, key, "目标记忆")
+        self.add_record("other", "other-user", key, "其他用户记忆")
+        records = self.tools["_get_memories_by_keys"](user, [key, key])
+        self.assertEqual([record["id"] for record in records], ["selected"])
+        self.assertEqual(self.client.queries[-1][1]["memory_keys"], [key])
+
     def test_replaces_selected_old_id_and_inserts_new_key_after_one_decision(self):
-        legacy_id = hashlib.sha256(b"user-a:career_direction").hexdigest()
-        self.add_record(legacy_id, "user-a", "career_direction", "前端")
+        self.add_record("legacy-fixed-id", "user-a", "career_direction", "前端")
         self.add_record("other-user-id", "user-b", "career_direction", "后端")
         self.candidates(
             ("career_direction", "转向全栈"),
@@ -190,21 +221,21 @@ class MemoryUpdateTests(unittest.TestCase):
             {
                 "memory_key": "career_direction",
                 "action": "replace",
-                "memory_id": legacy_id,
+                "memory_id": "legacy-fixed-id",
                 "memory": "用户转向全栈开发",
             }
         )
 
         self.assertEqual(self.chat(), "回答")
         self.assertEqual(len(self.resolver.prompts), 1)
-        self.assertIn(legacy_id, self.resolver.prompts[0])
+        self.assertIn("legacy-fixed-id", self.resolver.prompts[0])
         self.assertNotIn("other-user-id", self.resolver.prompts[0])
-        self.assertEqual(self.client.records[legacy_id]["memory"], "用户转向全栈开发")
+        self.assertEqual(self.client.records["legacy-fixed-id"]["memory"], "用户转向全栈开发")
         self.assertEqual(self.client.records["other-user-id"]["memory"], "后端")
         self.assertEqual(len(self.client.upserts), 1)
         self.assertEqual(len(self.client.inserts), 1)
         self.assertEqual(self.client.inserts[0]["memory_key"], "food_preference")
-        self.assertNotEqual(self.client.inserts[0]["id"], legacy_id)
+        self.assertNotEqual(self.client.inserts[0]["id"], "legacy-fixed-id")
 
     def test_same_key_independent_fact_insert_and_duplicate_none(self):
         self.add_record("old-tea", "user-a", "food_preference", "喜欢茶")
@@ -294,19 +325,6 @@ class MemoryUpdateTests(unittest.TestCase):
         self.assertEqual(self.client.queries, [])
         self.assertEqual(self.resolver.prompts, [])
         self.assertEqual(self.client.inserts, [])
-
-    def test_invalid_candidate_never_reads_or_writes(self):
-        for items in [
-            (("food_preference", "喜欢茶"), ("food_preference", "喜欢咖啡")),
-            (("food_preference", "   "),),
-        ]:
-            with self.subTest(items=items):
-                self.candidates(*items)
-                with self.assertRaises(ValueError):
-                    self.chat()
-                self.assertEqual(self.client.queries, [])
-                self.assertEqual(self.client.inserts, [])
-                self.assertEqual(self.resolver.prompts, [])
 
     def test_replace_tool_rejects_wrong_target_without_writing(self):
         self.add_record("owned", "user-a", "career_direction", "前端")

@@ -32,12 +32,13 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 ```bash
 curl http://127.0.0.1:8000/health
 
-curl -X POST http://127.0.0.1:8000/chat \
+curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
   -d '{"user_id":"demo-user","session_id":"demo-session","message":"你好"}'
 ```
 
-`/chat` 返回 `{"answer":"..."}`。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担恢复 Agent 状态的工作。
+`/chat` 使用 SSE 返回 `token`、`usage`、`done` 或 `error` 事件。`usage` 是模型供应商经 LangChain 返回的真实 token 统计；供应商未返回时标记不可用，不按字符数伪造估算。前端以 `fetch` 发送 POST JSON 并读取响应流；浏览器原生 `EventSource` 不支持这里使用的 POST 请求体。收到 `done` 时，`data.answer` 是完整回复。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担 checkpoint 恢复状态的工作。
 
 `/chat` 在调用 Agent 前为当前用户/会话获取 PostgreSQL 事务级 advisory lock，并持有到 `ChatLog` 提交；同一会话的并发请求由数据库串行化，跨 API worker 也共享此约束。不同会话使用不同锁键，可并行处理。
 
@@ -53,9 +54,12 @@ curl -X POST http://127.0.0.1:8000/chat \
 python -m unittest discover -s tests -p 'test_checkpoint_flow.py'
 python -m unittest discover -s tests -p 'test_memory_update.py'
 python -m unittest discover -s tests -p 'test_recall_routing.py'
+python -m unittest discover -s tests -p 'test_stream_recovery.py'
 ```
 
-现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面三条定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
+`test_stream_recovery.py` 使用假模型验证 SSE 生成失败、checkpoint 清理、同会话重试，以及完整回答后记忆更新失败的边界。现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面的定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
+
+GitHub Actions 会在每次 push 和 pull request 时自动运行以上四组离线回归，配置位于 `.github/workflows/offline-regression.yml`。这些工作流不连接真实模型、PostgreSQL 或 Milvus。
 
 目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
 
