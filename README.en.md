@@ -47,9 +47,9 @@ First startup initializes the API tables and LangGraph checkpoint tables. A Post
 
 ```bash
 curl http://127.0.0.1:8000/health
-curl -N -X POST http://127.0.0.1:8000/chat \\
-  -H 'Content-Type: application/json' \\
-  -H 'Accept: text/event-stream' \\
+curl -N -X POST http://127.0.0.1:8000/chat \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
   -d '{"user_id":"demo-user","session_id":"demo-session","message":"Hello"}'
 ```
 
