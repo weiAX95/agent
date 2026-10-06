@@ -1,8 +1,27 @@
-# LLM Agent 项目
+# LLM Agent
 
-这个项目用 FastAPI 提供聊天接口，使用 LangChain Agent 回答问题，并通过 Milvus 保存和召回长期记忆。API 的聊天日志存放在 PostgreSQL；会话 checkpoint 也使用 PostgreSQL，以便同一会话在服务重启后继续。
+[English](README.en.md) · [项目进度](docs/TODO.md)
+
+基于 FastAPI、LangChain / LangGraph 的聊天 Agent 实验项目，探索流式响应、PostgreSQL 会话恢复与 Milvus 长期记忆。
+
+> **状态：实验阶段。** 已有离线回归测试和部分集成验证记录；真实模型、Milvus 与完整聊天接口的端到端联调尚未完成。当前不作为可直接对外部署的成品。
+
+## 项目关注的问题
+
+| 问题 | 当前实现 |
+| --- | --- |
+| 服务重启后的上下文恢复 | PostgreSQL checkpoint |
+| 不同用户与会话的历史隔离 | 稳定的复合会话标识 |
+| 同一会话的并发请求 | PostgreSQL 事务级 advisory lock |
+| 流式回复与失败恢复 | SSE 事件与定向离线回归 |
+| 长期记忆保存与召回 | Milvus 与本地嵌入模型 |
 
 ## 快速开始
+
+```bash
+git clone https://github.com/weiAX95/agent.git
+cd agent
+```
 
 从项目根目录运行。建议使用 Python 3.12；先准备 PostgreSQL、Milvus（默认 `localhost:19530`）以及本地嵌入模型 `~/models/bge-base-zh-v1.5`。当前工具模块在导入时会连接 Milvus 并加载嵌入模型，因此这些依赖不可用时，API 可能无法启动。
 
@@ -38,6 +57,8 @@ curl -N -X POST http://127.0.0.1:8000/chat \
   -d '{"user_id":"demo-user","session_id":"demo-session","message":"你好"}'
 ```
 
+## 工程细节
+
 `/chat` 使用 SSE 返回 `token`、`usage`、`done` 或 `error` 事件。`usage` 是模型供应商经 LangChain 返回的真实 token 统计；供应商未返回时标记不可用，不按字符数伪造估算。前端以 `fetch` 发送 POST JSON 并读取响应流；浏览器原生 `EventSource` 不支持这里使用的 POST 请求体。收到 `done` 时，`data.answer` 是完整回复。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担 checkpoint 恢复状态的工作。
 
 `/chat` 在调用 Agent 前为当前用户/会话获取 PostgreSQL 事务级 advisory lock，并持有到 `ChatLog` 提交；同一会话的并发请求由数据库串行化，跨 API worker 也共享此约束。不同会话使用不同锁键，可并行处理。
@@ -61,7 +82,7 @@ python -m unittest discover -s tests -p 'test_stream_recovery.py'
 
 GitHub Actions 会在每次 push 和 pull request 时自动运行以上四组离线回归，配置位于 `.github/workflows/offline-regression.yml`。这些工作流不连接真实模型、PostgreSQL 或 Milvus。
 
-目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
+以下为仓库原有的验证记录，本次文档整理未重新执行：\n\n目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
 
 ## 当前边界
 
