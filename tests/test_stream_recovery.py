@@ -242,6 +242,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "_usage_payload": lambda callback: {"available": False},
             "StreamingResponse": StreamingResponse,
             "Depends": lambda dependency: None,
+            "get_current_user": lambda: None,
             "get_db": lambda: None,
             "ChatLog": lambda **fields: SimpleNamespace(**fields),
             "text": lambda value: value,
@@ -252,7 +253,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(message="问题", user_id="user-1", session_id="session-3")
 
         first_db = FakeDB()
-        first_response = await endpoint(request, app_request, first_db)
+        first_response = await endpoint(request, app_request, {"user_id": "user-1"}, first_db)
         self.assertIsInstance(first_response, StreamingResponse)
         first_body = await self.response_text(first_response)
         self.assertIn("event: token", first_body)
@@ -263,7 +264,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chatlog_rows, [])
 
         retry_db = FakeDB()
-        retry_response = await endpoint(request, app_request, retry_db)
+        retry_response = await endpoint(request, app_request, {"user_id": "user-1"}, retry_db)
         retry_body = await self.response_text(retry_response)
         self.assertIn("event: done", retry_body)
         self.assertEqual(len(retry_db.added), 1)

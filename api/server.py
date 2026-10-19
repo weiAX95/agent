@@ -12,8 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
+from api.auth import get_current_user
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
@@ -31,13 +34,22 @@ from src.agent.main import build_agent, chat_stream
 from api.config import settings
 from api.db import Base, check_db_connection, engine, get_db
 from api.models import ChatLog
-from api.routers import paths, tasks, topics
+from api.routers import auth, paths, tasks, topics
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    # 启动时强制校验 JWT 配置，拒绝空值启动
+    if not settings.jwt_verifying_key:
+        raise RuntimeError("JWT_VERIFYING_KEY 未配置。请在 .env 中设置非空密钥。")
+    if not settings.jwt_issuer:
+        raise RuntimeError("JWT_ISSUER 未配置。")
+    if not settings.jwt_audience:
+        raise RuntimeError("JWT_AUDIENCE 未配置。")
+
     pool = None
     try:
         async with engine.begin() as conn:
@@ -61,6 +73,7 @@ async def lifespan(app: FastAPI):
             await pool.open(wait=True)
             checkpointer = AsyncPostgresSaver(pool)
             await checkpointer.setup()
+
         app.state.agent = build_agent(checkpointer)
         yield
     finally:
@@ -74,12 +87,15 @@ app = FastAPI(lifespan=lifespan)  # 关键：lifespan必须在这里传进去，
 app.include_router(paths.router)
 app.include_router(topics.router)
 app.include_router(tasks.router)
+app.include_router(auth.router)
 
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str
-    user_id: str
+
+
+bearer = HTTPBearer(auto_error=False)
 
 
 @app.get("/health")
@@ -92,13 +108,15 @@ async def health():
 async def chat_api(
     request: ChatRequest,
     http_request: Request,
+    current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     # Hold a transaction-scoped lock through the checkpoint write and ChatLog commit.
     # PostgreSQL coordinates requests to the same thread across API workers.
+    user_id = current_user["user_id"]
     await db.execute(
         text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS BIGINT))"),
-        {"lock_id": checkpoint_lock_id(request.user_id, request.session_id)},
+        {"lock_id": checkpoint_lock_id(user_id, request.session_id)},
     )
 
     event_queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
@@ -107,13 +125,11 @@ async def chat_api(
     async def publish_token(token: str) -> None:
         await event_queue.put(("token", token))
 
-    print("session_id:", request.session_id, "user_id:", request.user_id)
-
     async def run_chat() -> tuple[str, str | None]:
         try:
             status, answer = await chat_stream(
                 message=request.message,
-                user_id=request.user_id,
+                user_id=user_id,
                 session_id=request.session_id,
                 agent=http_request.app.state.agent,
                 on_token=publish_token,
@@ -128,7 +144,7 @@ async def chat_api(
             # The response has started by this point, so report failures as SSE events.
             logger.exception(
                 "Chat stream failed (user_id=%s, session_id=%s)",
-                request.user_id,
+                user_id,
                 request.session_id,
             )
             await event_queue.put(("usage", _usage_payload(usage_callback)))
@@ -142,7 +158,7 @@ async def chat_api(
         log_started = True
         db.add(
             ChatLog(
-                user_id=request.user_id,
+                user_id=user_id,
                 session_id=request.session_id,
                 message=request.message,
                 answer=answer,
@@ -181,7 +197,7 @@ async def chat_api(
                 except Exception:
                     logger.exception(
                         "Saving chat log failed (user_id=%s, session_id=%s)",
-                        request.user_id,
+                        user_id,
                         request.session_id,
                     )
                     await db.rollback()
@@ -211,7 +227,7 @@ async def chat_api(
             except Exception:
                 logger.exception(
                     "Finalizing disconnected chat failed (user_id=%s, session_id=%s)",
-                    request.user_id,
+                    user_id,
                     request.session_id,
                 )
                 await db.rollback()
