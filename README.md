@@ -6,6 +6,8 @@
 
 > **状态：实验阶段。** 已有离线回归测试和部分集成验证记录；真实模型、Milvus 与完整聊天接口的端到端联调尚未完成。当前不作为可直接对外部署的成品。
 
+此分支包含待进一步验收的 JWT 认证与学习路径所有权改动；以下命令按该分支代码编写。
+
 ## 项目关注的问题
 
 | 问题 | 当前实现 |
@@ -38,6 +40,10 @@ DATABASE_URL=postgresql+asyncpg://agent:your_password@localhost:5432/agent
 OPENAI_API_KEY=your_key
 OPENAI_BASE_URL=https://your-model-api.example/v1
 OPENAI_MODEL=your_model
+JWT_SIGNING_KEY=replace_with_a_long_random_secret
+JWT_VERIFYING_KEY=replace_with_the_same_secret
+JWT_ISSUER=agent-api
+JWT_AUDIENCE=agent-web
 ```
 
 启动 API：
@@ -46,7 +52,7 @@ OPENAI_MODEL=your_model
 python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-首次启动会初始化 API 使用的 SQLAlchemy 表和 LangGraph checkpoint 表；初始化过程由 PostgreSQL advisory lock 串行化，避免多个 API worker 同时执行迁移。检查数据库连接，再发送聊天请求：
+首次启动会初始化 API 使用的 SQLAlchemy 表和 LangGraph checkpoint 表；初始化过程由 PostgreSQL advisory lock 串行化，避免多个 API worker 同时执行迁移。先通过 `/api/auth/register` 或 `/api/auth/login` 获取 `access_token`，再检查数据库连接并发送聊天请求：
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -54,7 +60,8 @@ curl http://127.0.0.1:8000/health
 curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"user_id":"demo-user","session_id":"demo-session","message":"你好"}'
+  -H 'Authorization: Bearer <access_token>' \
+  -d '{"session_id":"demo-session","message":"你好"}'
 ```
 
 ## 工程细节
@@ -86,7 +93,7 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上四组离
 
 ## 当前边界
 
-- 请求体中的 `user_id` 尚未通过身份认证。复合会话 ID 能防止不同用户意外共用同一 checkpoint，但调用方仍可伪造他人的 `user_id`；对外提供服务前，需要从可信认证上下文获取身份，并校验会话归属。
+- `/chat` 已从 JWT 中读取用户 ID，学习路径相关接口也添加了所有权校验；认证、账号禁用、旧数据归属和完整 API 联调尚未完成验收，不应直接对外部署。
 - 旧版 `InMemorySaver` 中的历史不会自动迁移到 PostgreSQL；新部署从新的 checkpoint 开始。
 - 当前 `/chat` 用 PostgreSQL advisory lock 串行化同一会话；锁等待超时、高并发延迟和多进程效果仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
 - `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/chat` 的验收结果。
@@ -95,6 +102,10 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上四组离
 
 - [问题与改进 TODO](docs/TODO.md)：问题状态、验收条件和后续工作。
 - [自动召回学习文档](docs/auto_recall.md)：长期记忆读取、向量检索与 Graph 改造。
+- [JWT 学习与集成指南](docs/jwt_auth.md)：认证设计与原有风险分析；此分支有部分实现，需继续验收。
 - [学习进度路线](docs/learning_progress_roadmap.md) 与 [Agent 学习路线](docs/agent_learning_roadmap.md)：分阶段学习计划。
+- [网关基建与评测路线](docs/gateway_evaluation_roadmap.md)：API、模型与工具边界，以及运行和质量指标。
+- [聊天流程迁移记录](docs/chat_graph_migration.md)：独立工作树的 Graph 实验与验证；此分支尚未合入该实验。
+- [Codex/DeepSeek 回退方案](docs/codex_deepseek_fallback.md)：本地网关的配置与边界。
 
 主要代码入口为 [API](api/server.py)、[Agent](src/agent/main.py)、[记忆工具](src/agent/tools.py) 和 [独立 Graph 示例](src/agent/graph.py)。

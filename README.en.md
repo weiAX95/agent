@@ -6,6 +6,8 @@ An experimental chat agent built with FastAPI and LangChain / LangGraph, explori
 
 > **Status: experimental.** Offline regression tests and partial integration verification are documented. End-to-end integration of real models, Milvus, and the complete chat API remains unfinished. This is not a ready-to-deploy public service.
 
+This branch also contains JWT authentication and learning-path ownership changes that still need end-to-end validation.
+
 ## Problems explored
 
 | Problem | Current approach |
@@ -35,6 +37,10 @@ DATABASE_URL=postgresql+asyncpg://agent:your_password@localhost:5432/agent
 OPENAI_API_KEY=your_key
 OPENAI_BASE_URL=https://your-model-api.example/v1
 OPENAI_MODEL=your_model
+JWT_SIGNING_KEY=replace_with_a_long_random_secret
+JWT_VERIFYING_KEY=replace_with_the_same_secret
+JWT_ISSUER=agent-api
+JWT_AUDIENCE=agent-web
 ```
 
 Replace placeholders locally. Do not commit real credentials. The database account needs permission to create checkpoint tables on first startup. [checkpoint.py](src/agent/checkpoint.py) converts the SQLAlchemy asyncpg URL into a psycopg connection string for the same PostgreSQL database.
@@ -45,12 +51,15 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 
 First startup initializes the API tables and LangGraph checkpoint tables. A PostgreSQL advisory lock serializes initialization across API workers.
 
+Get an `access_token` from `/api/auth/register` or `/api/auth/login` before calling `/chat`:
+
 ```bash
 curl http://127.0.0.1:8000/health
 curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"user_id":"demo-user","session_id":"demo-session","message":"Hello"}'
+  -H 'Authorization: Bearer <access_token>' \
+  -d '{"session_id":"demo-session","message":"Hello"}'
 ```
 
 ## Engineering details
@@ -87,7 +96,7 @@ python -m unittest discover -s tests -p 'test_stream_recovery.py'
 
 ## Known limitations
 
-- Request-body `user_id` is not authenticated. Composite identities avoid accidental sharing but do not prevent impersonation. A public service must derive identity from trusted authentication and check conversation ownership.
+- `/chat` now derives its user ID from a JWT and learning-path routes check ownership. Authentication, disabled accounts, existing-data ownership, and the full API still need validation before public deployment.
 - Old `InMemorySaver` history is not migrated; new deployments start with new checkpoints.
 - Lock wait timeouts, high-concurrency latency, and multi-process behavior need load testing. Checkpoint writes and `ChatLog` commits use separate connections and transactions: checkpoint state may advance even when log persistence fails. Compensation or retry behavior remains to be defined.
 - [graph.py](src/agent/graph.py) is a separate learning entry point and is not unified with the API persistence flow. Its examples are not acceptance evidence for `/chat`.
