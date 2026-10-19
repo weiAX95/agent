@@ -1,9 +1,7 @@
-import asyncio
 import datetime
 import json
 import os
 import sys
-import uuid
 from pathlib import Path
 from typing import Literal, TypeAlias
 
@@ -18,6 +16,7 @@ from pydantic import BaseModel
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.agent.checkpoint import make_thread_id
+from src.agent.chat_workflow import ChatServices, build_chat_workflow
 from src.agent.tools import (
     _get_memories_by_keys,
     _recall_memories,
@@ -552,80 +551,12 @@ def _prepare_chat(
     return memory_cache, get_memories, agent_input, agent_config, agent_context
 
 
-def _update_long_term_memory(
-    message: str, user_id: str, memory_cache, get_memories, callbacks=None
-) -> None:
-
-    if not should_extract_memory(message):
-        print("跳过长期记忆抽取：当前消息不像长期事实陈述")
-        return
-
-    candidate = judge_memory(message, callbacks=callbacks)
-    candidate_by_key: dict[str, str] = {}
-    for item in candidate.memories:
-        if item.memory_key in candidate_by_key:
-            raise ValueError(f"重复的候选记忆类别: {item.memory_key}")
-        if not item.memory.strip():
-            raise ValueError(f"{item.memory_key} 的候选记忆不能为空")
-        candidate_by_key[item.memory_key] = item.memory.strip()
-
-    existing_by_key: dict[str, list[dict]] = {}
-    for item in get_memories(list(candidate_by_key)):
-        existing_by_key.setdefault(item["memory_key"], []).append(item)
-
-    resolve_items = [
-        {
-            "memory_key": key,
-            "new_memory": memory,
-            "old_memories": [
-                {"id": item["id"], "memory": item["memory"]}
-                for item in existing_by_key[key]
-            ],
-        }
-        for key, memory in candidate_by_key.items()
-        if key in existing_by_key
-    ]
-    resolution_by_key = (
-        validate_memory_resolutions(
-            resolve_memories(resolve_items, message, callbacks=callbacks), existing_by_key
-        )
-        if resolve_items
-        else {}
-    )
-
-    # 决策全部校验通过后再写库；模型输出顺序不影响对应关系。
-    for key, memory in candidate_by_key.items():
-        resolution = resolution_by_key.get(key)
-        if resolution is None or resolution.action == "insert":
-            save_to_memory.invoke(
-                {"user_id": user_id, "memory": memory, "memory_key": key}
-            )
-            memory_cache.pop(key, None)
-            print("新增记忆:", key, memory)
-        elif resolution.action == "replace":
-            replacement = resolution.memory.strip()
-            replace_memory(
-                user_id=user_id,
-                memory=replacement,
-                memory_key=key,
-                memory_id=resolution.memory_id,
-            )
-            memory_cache.pop(key, None)
-            print("替换记忆:", key, resolution.memory_id, replacement)
-        else:
-            print("重复记忆，不保存:", key)
-
-    return None
-
-
 def chat(message: str, session_id: str, user_id: str, agent) -> str:
-    memory_cache, get_memories, agent_input, agent_config, agent_context = _prepare_chat(
-        message, session_id, user_id, agent
-    )
-    result = agent.invoke(agent_input, config=agent_config, context=agent_context)
-    answer = result["messages"][-1].content
-    _update_long_term_memory(message, user_id, memory_cache, get_memories)
-    return answer
+    result = chat_workflow.invoke({
+        "message": message, "session_id": session_id,
+        "user_id": user_id, "agent": agent,
+    })
+    return result["answer"]
 
 
 def _content_to_text(content) -> str:
@@ -673,63 +604,12 @@ async def _restore_stopped_turn(agent, config, message_id: str, prompt: str, par
 async def chat_stream(
     message: str, session_id: str, user_id: str, agent, on_token, callbacks=None
 ) -> tuple[str, str]:
-    (
-        memory_cache,
-        get_memories,
-        agent_input,
-        agent_config,
-        agent_context,
-    ) = await asyncio.to_thread(
-        _prepare_chat, message, session_id, user_id, agent, callbacks
-    )
-    message_id = str(uuid.uuid4())
-    agent_input["messages"] = [HumanMessage(id=message_id, content=message)]
-    partial = ""
-
-    try:
-        async for part in agent.astream(
-            agent_input,
-            config=(
-                {**agent_config, "callbacks": callbacks}
-                if callbacks
-                else agent_config
-            ),
-            context=agent_context,
-            stream_mode=["messages", "updates"],
-            version="v2",
-        ):
-            if part["type"] == "messages":
-                chunk, metadata = part["data"]
-                if metadata.get("langgraph_node") == "model":
-                    token = _content_to_text(chunk.content)
-                    if token:
-                        partial += token
-                        await on_token(token)
-            elif part["type"] == "updates":
-                model_update = part["data"].get("model", {})
-                messages = model_update.get("messages", [])
-                if messages:
-                    answer = _content_to_text(messages[-1].content)
-                    if answer:
-                        partial = answer
-    except asyncio.CancelledError:
-        await asyncio.shield(
-            _restore_stopped_turn(agent, agent_config, message_id, message, partial)
-        )
-        return "stopped", partial
-    except Exception:
-        await _discard_incomplete_turn(agent, agent_config, message_id)
-        raise
-
-    await asyncio.to_thread(
-        _update_long_term_memory,
-        message,
-        user_id,
-        memory_cache,
-        get_memories,
-        callbacks,
-    )
-    return "done", partial
+    result = await chat_workflow.ainvoke({
+        "message": message, "session_id": session_id,
+        "user_id": user_id, "agent": agent,
+        "on_token": on_token, "callbacks": callbacks,
+    })
+    return result["status"], result["answer"]
 
 
 async def _discard_incomplete_turn(agent, config, message_id: str) -> None:
@@ -747,3 +627,17 @@ async def _discard_incomplete_turn(agent, config, message_id: str) -> None:
             )
     except Exception:
         pass
+
+
+chat_workflow = build_chat_workflow(ChatServices(
+    prepare_chat=_prepare_chat,
+    should_extract_memory=should_extract_memory,
+    judge_memory=judge_memory,
+    resolve_memories=resolve_memories,
+    validate_memory_resolutions=validate_memory_resolutions,
+    save_to_memory=save_to_memory,
+    replace_memory=replace_memory,
+    content_to_text=_content_to_text,
+    restore_stopped_turn=_restore_stopped_turn,
+    discard_incomplete_turn=_discard_incomplete_turn,
+))

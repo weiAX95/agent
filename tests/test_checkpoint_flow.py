@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy.engine import make_url
+from chat_graph_loader import attach_chat_workflow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,9 +117,7 @@ class ChatCheckpointTests(unittest.TestCase):
         load_function(
             ROOT / "src/agent/main.py", "_prepare_chat", self.namespace
         )
-        load_function(
-            ROOT / "src/agent/main.py", "_update_long_term_memory", self.namespace
-        )
+        attach_chat_workflow(self.namespace)
         self.chat = load_function(ROOT / "src/agent/main.py", "chat", self.namespace)
 
     def call_chat(self, user_id, session_id, message="你好"):

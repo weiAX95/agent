@@ -16,6 +16,7 @@ from typing import Literal, TypeAlias
 from unittest.mock import Mock
 
 from pydantic import BaseModel
+from chat_graph_loader import attach_chat_workflow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,6 @@ def load_routing(namespace):
         "route_memory_keys",
         "route_memory_keys_with_llm",
         "_prepare_chat",
-        "_update_long_term_memory",
         "chat",
     }
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -76,6 +76,7 @@ class RecallRoutingTests(unittest.TestCase):
             "make_thread_id": lambda user_id, session_id: "offline-thread",
         }
         load_routing(self.namespace)
+        attach_chat_workflow(self.namespace)
 
     def router_decision(self, should_recall, keys):
         decision = self.namespace["MemoryRecallDecision"](

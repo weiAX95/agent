@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, RemoveMessage
 from starlette.responses import StreamingResponse
+from chat_graph_loader import attach_chat_workflow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,10 +113,11 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 {"system_prompt": "test"},
             )
 
-        def update_memory(*args):
-            memory_updates.append(args)
+        def judge_memory(message, callbacks=None):
+            memory_updates.append(message)
             if memory_error:
                 raise RuntimeError("simulated memory update failure")
+            return SimpleNamespace(memories=[])
 
         namespace = {
             "asyncio": asyncio,
@@ -124,10 +126,13 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "AIMessage": AIMessage,
             "RemoveMessage": RemoveMessage,
             "_prepare_chat": prepare,
-            "_update_long_term_memory": update_memory,
+            "should_extract_memory": lambda message: True,
+            "judge_memory": judge_memory,
         }
         load_function(ROOT / "src/agent/main.py", "_content_to_text", namespace)
+        load_function(ROOT / "src/agent/main.py", "_restore_stopped_turn", namespace)
         load_function(ROOT / "src/agent/main.py", "_discard_incomplete_turn", namespace)
+        attach_chat_workflow(namespace)
         streamer = load_function(ROOT / "src/agent/main.py", "chat_stream", namespace)
         return streamer, memory_updates
 
@@ -182,8 +187,11 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def ignore_token(token):
             return None
 
-        with self.assertRaisesRegex(RuntimeError, "simulated memory update failure"):
-            await streamer("新问题", "session-2", "user-1", agent, ignore_token)
+        with self.assertLogs("src.agent.chat_workflow", level="ERROR"):
+            self.assertEqual(
+                await streamer("新问题", "session-2", "user-1", agent, ignore_token),
+                ("done", "恢复后的完整回答"),
+            )
 
         self.assertEqual(
             [(item.type, item.content) for item in agent.messages],

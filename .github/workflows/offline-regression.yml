@@ -29,3 +29,4 @@ jobs:
           python -m unittest discover -s tests -p 'test_memory_update.py' -v
           python -m unittest discover -s tests -p 'test_recall_routing.py' -v
           python -m unittest discover -s tests -p 'test_stream_recovery.py' -v
+          python -m unittest discover -s tests -p 'test_chat_workflow.py' -v

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel
+from chat_graph_loader import attach_chat_workflow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -167,7 +168,6 @@ class MemoryUpdateTests(unittest.TestCase):
                 "resolve_memories",
                 "validate_memory_resolutions",
                 "_prepare_chat",
-                "_update_long_term_memory",
                 "chat",
             },
             self.flow,
@@ -175,6 +175,7 @@ class MemoryUpdateTests(unittest.TestCase):
         self.flow["save_to_memory"] = SimpleNamespace(
             invoke=lambda values: self.tools["_insert_memory"](**values)
         )
+        attach_chat_workflow(self.flow)
 
     def add_record(self, memory_id, user, key, memory):
         self.client.records[memory_id] = {
@@ -314,8 +315,9 @@ class MemoryUpdateTests(unittest.TestCase):
         for decisions in bad_batches:
             with self.subTest(decisions=decisions):
                 self.decisions(*decisions)
-                with self.assertRaises(ValueError):
-                    self.chat()
+                with self.assertLogs("src.agent.chat_workflow", level="ERROR") as logs:
+                    self.assertEqual(self.chat(), "回答")
+                self.assertIn("Chat memory stage failed: resolve", logs.output[0])
                 self.assertEqual(self.client.inserts, [])
                 self.assertEqual(self.client.upserts, [])
 
