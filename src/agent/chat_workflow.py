@@ -3,13 +3,13 @@
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, TypedDict
+from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END, START, StateGraph
-
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +52,11 @@ def build_chat_workflow(services: ChatServices):
 
     def recall(state: ChatState) -> dict:
         cache, get_memories, payload, config, context = services.prepare_chat(
-            state["message"], state["session_id"], state["user_id"],
-            state["agent"], state.get("callbacks"),
+            state["message"],
+            state["session_id"],
+            state["user_id"],
+            state["agent"],
+            state.get("callbacks"),
         )
         return {
             "memory_cache": cache,
@@ -83,8 +86,11 @@ def build_chat_workflow(services: ChatServices):
         try:
             async for part in state["agent"].astream(
                 payload,
-                config=({**config, "callbacks": state["callbacks"]}
-                        if state.get("callbacks") else config),
+                config=(
+                    {**config, "callbacks": state["callbacks"]}
+                    if state.get("callbacks")
+                    else config
+                ),
                 context=state["agent_context"],
                 stream_mode=["messages", "updates"],
                 version="v2",
@@ -116,6 +122,7 @@ def build_chat_workflow(services: ChatServices):
 
     def judge(state: ChatState) -> dict:
         if not services.should_extract_memory(state["message"]):
+            print("[Memory Extract] skipped: empty message")
             return {"candidate_by_key": {}}
         candidate = services.judge_memory(
             state["message"], callbacks=state.get("callbacks")
@@ -127,6 +134,7 @@ def build_chat_workflow(services: ChatServices):
             if not item.memory.strip():
                 raise ValueError(f"{item.memory_key} 的候选记忆不能为空")
             by_key[item.memory_key] = item.memory.strip()
+        print("[Memory Extract] candidate_keys=", list(by_key))
         return {"candidate_by_key": by_key}
 
     def resolve(state: ChatState) -> dict:
@@ -143,7 +151,8 @@ def build_chat_workflow(services: ChatServices):
                     for item in existing[key]
                 ],
             }
-            for key, memory in by_key.items() if key in existing
+            for key, memory in by_key.items()
+            if key in existing
         ]
         decisions = (
             services.validate_memory_resolutions(
@@ -151,7 +160,9 @@ def build_chat_workflow(services: ChatServices):
                     items, state["message"], callbacks=state.get("callbacks")
                 ),
                 existing,
-            ) if items else {}
+            )
+            if items
+            else {}
         )
         return {"resolution_by_key": decisions}
 
@@ -159,15 +170,24 @@ def build_chat_workflow(services: ChatServices):
         for key, memory in state["candidate_by_key"].items():
             decision = state["resolution_by_key"].get(key)
             if decision is None or decision.action == "insert":
-                services.save_to_memory.invoke({
-                    "user_id": state["user_id"], "memory": memory,
-                    "memory_key": key,
-                })
+                services.save_to_memory.invoke(
+                    {
+                        "user_id": state["user_id"],
+                        "memory": memory,
+                        "memory_key": key,
+                    }
+                )
+                print("[Memory Persist] insert succeeded: key=", key)
             elif decision.action == "replace":
                 services.replace_memory(
-                    user_id=state["user_id"], memory=decision.memory.strip(),
-                    memory_key=key, memory_id=decision.memory_id,
+                    user_id=state["user_id"],
+                    memory=decision.memory.strip(),
+                    memory_key=key,
+                    memory_id=decision.memory_id,
                 )
+                print("[Memory Persist] replace succeeded: key=", key)
+            else:
+                print("[Memory Persist] unchanged: key=", key)
         return {}
 
     def safe(name: str, operation: Callable):
@@ -195,10 +215,18 @@ def build_chat_workflow(services: ChatServices):
         "answer", lambda state: END if state.get("status") == "stopped" else "judge"
     )
     workflow.add_conditional_edges(
-        "judge", lambda state: END if state.get("memory_error") or not state.get("candidate_by_key") else "resolve"
+        "judge",
+        lambda state: (
+            END
+            if state.get("memory_error") or not state.get("candidate_by_key")
+            else "resolve"
+        ),
     )
     workflow.add_conditional_edges(
         "resolve", lambda state: END if state.get("memory_error") else "persist"
     )
     workflow.add_edge("persist", END)
-    return workflow.compile()
+    graph = workflow.compile()
+    print(graph.get_graph().draw_mermaid())
+
+    return graph

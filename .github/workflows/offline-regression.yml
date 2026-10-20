@@ -30,3 +30,5 @@ jobs:
           python -m unittest discover -s tests -p 'test_recall_routing.py' -v
           python -m unittest discover -s tests -p 'test_stream_recovery.py' -v
           python -m unittest discover -s tests -p 'test_chat_workflow.py' -v
+          python -m unittest discover -s tests -p 'test_feedback_api.py' -v
+          python -m unittest discover -s tests -p 'test_feedback_loop.py' -v

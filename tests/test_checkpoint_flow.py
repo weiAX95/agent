@@ -292,6 +292,7 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
             "_usage_payload": fake_usage_payload,
             "StreamingResponse": StreamingResponse,
             "Depends": lambda dependency: None,
+            "get_current_user": lambda: None,
             "get_db": lambda: None,
             "Request": object,
             "sys": __import__("sys"),
@@ -302,11 +303,11 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
         }
         endpoint = load_function(ROOT / "api/server.py", "chat_api", namespace)
         db = FakeDB()
-        request = SimpleNamespace(message="你好", session_id="s1", user_id="alice")
+        request = SimpleNamespace(message="你好", session_id="s1", user_id="spoofed")
         http_request = SimpleNamespace(app=app)
 
         with contextlib.redirect_stdout(io.StringIO()):
-            result = await endpoint(request, http_request, db)
+            result = await endpoint(request, http_request, {"user_id": "alice"}, db)
 
         self.assertIsInstance(result, StreamingResponse)
         frames = [frame async for frame in result.body_iterator]
@@ -315,7 +316,10 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('event: token\ndata: {"content": "一段"}', body)
         self.assertIn('event: usage\ndata: {"available": true', body)
-        self.assertIn('event: done\ndata: {"answer": "完整回答"}', body)
+        done_frame = next(frame for frame in body.split("\n\n") if frame.startswith("event: done\n"))
+        done_payload = json.loads(done_frame.split("data: ", 1)[1])
+        self.assertEqual(done_payload["answer"], "完整回答")
+        self.assertEqual(done_payload["chat_log_id"], str(db.added[0].id))
         self.assertEqual(events, ["lock", "chat", "add_log", "commit"])
         self.assertEqual(len(db.executions), 1)
         statement, params = db.executions[0]
@@ -441,7 +445,12 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             "AsyncConnectionPool": FakePool,
             "AsyncPostgresSaver": FakeSaver,
             "build_agent": fake_build_agent,
-            "settings": SimpleNamespace(database_url="postgresql+asyncpg://u:p@h/db"),
+            "settings": SimpleNamespace(
+                database_url="postgresql+asyncpg://u:p@h/db",
+                jwt_verifying_key="test-verifying-key",
+                jwt_issuer="test-issuer",
+                jwt_audience="test-audience",
+            ),
             "checkpoint_dsn": lambda url: "postgresql://u:p@h/db",
             "CHECKPOINT_SETUP_LOCK_ID": CHECKPOINT_SETUP_LOCK_ID,
             "dict_row": row_factory,

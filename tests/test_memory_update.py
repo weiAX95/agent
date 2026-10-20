@@ -42,16 +42,21 @@ def load_definitions(path, names, namespace):
 
 
 class MemoryExtractionGateTests(unittest.TestCase):
-    def test_only_durable_personal_statements_trigger_extraction(self):
+    def test_nonempty_messages_reach_model_without_keyword_or_question_filter(self):
         namespace = {}
         load_definitions(
             ROOT / "src/agent/main.py", {"should_extract_memory"}, namespace
         )
         should_extract = namespace["should_extract_memory"]
-        self.assertTrue(should_extract("我目前从事软件开发工作"))
-        self.assertTrue(should_extract("我喜欢喝咖啡"))
-        self.assertFalse(should_extract("帮我解释一下 Python 的 async"))
-        self.assertFalse(should_extract("我喜欢什么？"))
+        for message in (
+            "我叫张三", "OK。我叫张三。我喜欢吃西瓜", "以后叫我小张",
+            "家里养了一只猫", "我叫张三，你记住了吗？",
+            "帮我解释一下 Python 的 async", "我喜欢什么？", "额",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(should_extract(message))
+        self.assertFalse(should_extract(""))
+        self.assertFalse(should_extract("  \n "))
 
 
 class FakeMilvus:
@@ -198,9 +203,87 @@ class MemoryUpdateTests(unittest.TestCase):
             resolutions=[model(**item) for item in items]
         )
 
-    def chat(self):
+    def chat(self, message="用户本轮消息", session_id="session-1", user_id="user-a"):
         with contextlib.redirect_stdout(io.StringIO()):
-            return self.flow["chat"]("用户本轮消息", "session-1", "user-a", self.agent)
+            return self.flow["chat"](message, session_id, user_id, self.agent)
+
+    def enable_real_extraction(self, memories):
+        # Only the external model is replaced; run the real gate and judge node.
+        self.candidate_prompts = []
+
+        def invoke(prompt, config=None):
+            self.candidate_prompts.append(prompt)
+            return self.flow["MemoryCandidate"].model_validate({"memories": memories})
+
+        self.flow["candidate_llm"] = SimpleNamespace(invoke=invoke)
+        load_definitions(
+            ROOT / "src/agent/main.py",
+            {"should_extract_memory", "judge_memory"}, self.flow,
+        )
+
+    def test_name_and_food_are_saved_then_recalled_in_another_session(self):
+        self.enable_real_extraction([
+            {"memory_key": "user_name", "memory": "用户叫张三"},
+            {"memory_key": "food_preference", "memory": "用户喜欢吃西瓜"},
+        ])
+        self.assertEqual(self.chat("OK。我叫张三。我喜欢吃西瓜"), "回答")
+        self.assertEqual(
+            {(row["memory_key"], row["memory"]) for row in self.client.records.values()},
+            {("user_name", "用户叫张三"), ("food_preference", "用户喜欢吃西瓜")},
+        )
+        self.assertEqual(len(self.embedding.calls), 2)
+        self.assertEqual(len(self.candidate_prompts), 1)
+
+        load_definitions(
+            ROOT / "src/agent/main.py",
+            {"should_recall_memory", "route_memory_keys"}, self.flow,
+        )
+        self.enable_real_extraction([])
+        prompts = []
+        self.agent.invoke = lambda payload, **kwargs: (
+            prompts.append(kwargs["context"]["system_prompt"])
+            or {"messages": [SimpleNamespace(content="回答")]}
+        )
+        self.chat("我叫什么", session_id="new-session")
+        self.assertIn("用户叫张三", prompts[-1])
+        self.chat("我叫什么", session_id="new-session", user_id="user-b")
+        self.assertNotIn("用户叫张三", prompts[-1])
+        self.assertEqual(len(self.client.inserts), 2)
+
+    def test_name_duplicate_and_correction_preserve_other_users_and_preferences(self):
+        self.add_record("name-a", "user-a", "user_name", "用户叫张三")
+        self.add_record("name-b", "user-b", "user_name", "用户叫王五")
+        self.add_record("food-a", "user-a", "food_preference", "用户喜欢吃西瓜")
+        self.enable_real_extraction([{"memory_key": "user_name", "memory": "用户叫张三"}])
+        self.decisions({"memory_key": "user_name", "action": "none"})
+        self.chat("我叫张三")
+        self.assertEqual(len(self.client.records), 3)
+        self.assertEqual(self.client.inserts, [])
+        self.enable_real_extraction([{"memory_key": "user_name", "memory": "用户改名叫李四"}])
+        self.decisions({"memory_key": "user_name", "action": "replace", "memory_id": "name-a", "memory": "用户叫李四"})
+        self.chat("我改名叫李四了")
+        self.assertEqual(self.client.records["name-a"]["memory"], "用户叫李四")
+        self.assertEqual(self.client.records["name-b"]["memory"], "用户叫王五")
+        self.assertEqual(self.client.records["food-a"]["memory"], "用户喜欢吃西瓜")
+        self.assertEqual(len(self.client.upserts), 1)
+
+    def test_preferred_name_and_background_have_independent_categories(self):
+        self.enable_real_extraction([
+            {"memory_key": "preferred_name", "memory": "用户希望被称为小张"},
+            {"memory_key": "personal_background", "memory": "用户养了一只猫"},
+        ])
+        self.chat("以后叫我小张，家里养了一只猫")
+        self.assertEqual({row["memory_key"] for row in self.client.inserts}, {"preferred_name", "personal_background"})
+
+    def test_empty_model_result_does_not_store_questions_quotes_or_chitchat(self):
+        self.enable_real_extraction([])
+        for message in ("额", "张三是谁？", "我叫什么", "假如我叫张三", "他说：我叫张三"):
+            with self.subTest(message=message):
+                self.chat(message)
+        self.assertEqual(len(self.candidate_prompts), 5)
+        self.assertEqual(self.client.queries, [])
+        self.assertEqual(self.client.inserts, [])
+        self.assertEqual(self.embedding.calls, [])
 
     def test_query_escapes_literals_and_preserves_user_scope(self):
         user = 'user"\\特殊'

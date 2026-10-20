@@ -2,6 +2,8 @@
 
 > 基于项目实际代码定制 · 大模型幻觉研究 · Agent 核心模块：记忆 / 规划 / 行动 / 工具
 
+> 本路线最初写于 2026-09-12，部分代码示例是学习练习，不代表当前正式入口。2026-10-19 的主 API 已使用 [请求级业务图](graph.md)、PostgreSQL checkpoint 和 POST SSE；当前代码另有 JWT/资源归属实现。当前实现与剩余验收以 [TODO](TODO.md) 和 [学习进度路线](learning_progress_roadmap.md) 为准。
+
 ---
 
 ## 地图总览
@@ -50,11 +52,11 @@
 
 ---
 
-## Phase 2 ✓ — Tool-Call Agent（手写循环）
+## Phase 2 ✓ — Tool-Call Agent（历史练习）
 
-**代码证据**：`src/agent/main.py`、`src/agent/tools.py`、`src/agent/smith.py`
+**当前代码证据**：`src/agent/main.py`、`src/agent/tools.py`、`src/agent/smith.py`。正式 `main.py` 使用 `create_agent()`；下表中的手写循环是此前的学习主题，不是当前 API 实现。
 
-这是项目的**核心成就**，手写了一遍完整的 Agent Loop：
+学习主题是手写 Agent Loop：
 
 ```
 LLM 调用 → 检查 tool_calls → 执行工具 → ToolMessage 回填 → 循环
@@ -63,11 +65,8 @@ LLM 调用 → 检查 tool_calls → 执行工具 → ToolMessage 回填 → 循
 | 已掌握 | 对应文件 |
 |--------|----------|
 | `@tool` 装饰器定义工具 | `tools.py` |
-| `bind_tools` 绑定工具到 LLM | `main.py` |
-| Agent Loop（最多 N 轮） | `main.py` |
-| 工具异常捕获与降级 | `main.py` |
-| ToolMessage 回填结果 | `main.py` |
-| `create_agent` 高层封装 | `smith.py` |
+| `bind_tools` 与手写循环 | 历史练习；不作为当前 `main.py` 行为依据 |
+| `create_agent` 高层封装 | 当前 `main.py`、`smith.py` |
 
 ---
 
@@ -85,9 +84,9 @@ LLM 调用 → 检查 tool_calls → 执行工具 → ToolMessage 回填 → 循
 
 ---
 
-## Phase 4 → 当前阶段：对话记忆系统
+## Phase 4 — 对话记忆系统（主流程已接入，继续验收）
 
-> **现在最该补的短板**。`main.py` 每次运行都是全新对话，没有跨轮次的记忆持久化。
+> 主 API 的内层 Agent 已使用 PostgreSQL checkpoint 保存多轮历史，并按用户/会话生成复合线程 ID；仍需完整 API 重启、双用户隔离与长期记忆联调。下面的 `MemorySaver` 示例仅供学习，不是现行持久化方案。
 >
 > **重要说明**：LangChain 旧版 Memory 模块（`ConversationBufferMemory` 等）在 `langchain-core >= 0.3` 中已被标记为 **legacy**，官方推荐迁移到 **LangGraph Checkpointer** 机制。当前项目安装的是 `langchain-core==1.6.2`，应直接学新方案，跳过旧 API。
 
@@ -101,7 +100,7 @@ LLM 调用 → 检查 tool_calls → 执行工具 → ToolMessage 回填 → 循
 
 # ✓ 新方案：LangGraph Checkpointer
 from langgraph.checkpoint.memory import MemorySaver       # 内存存储（开发调试用）
-from langgraph.checkpoint.sqlite import SqliteSaver        # SQLite 持久化（生产用）
+from langgraph.checkpoint.sqlite import SqliteSaver        # SQLite 示例；本项目正式入口使用 PostgreSQL
 
 # 编译 Graph 时注入 checkpointer
 app = graph.compile(checkpointer=MemorySaver())
@@ -114,7 +113,7 @@ result = app.invoke({"messages": [HumanMessage("你好")]}, config=config)
 result = app.invoke({"messages": [HumanMessage("我刚才说了什么？")]}, config=config)
 ```
 
-**练习**：用 LangGraph 改造 `main.py`，加入 `MemorySaver` checkpointer，让同一 `thread_id` 下的对话历史自动持久化。
+**练习**：用独立示例比较 `MemorySaver` 与正式 PostgreSQL checkpoint 的重启恢复行为，不要把进程内存中的状态当作持久化验证。
 
 ---
 
@@ -122,7 +121,7 @@ result = app.invoke({"messages": [HumanMessage("我刚才说了什么？")]}, co
 
 **目标**：跨会话记住用户偏好和历史结论
 
-> 旧方案 `VectorStoreRetrieverMemory` 同样是 legacy。新方案是把 Milvus 检索封装为 LangGraph 的工具节点，由 Agent 主动决定何时读写记忆。
+> 正式入口已通过业务图的 `recall` 节点在回答前读取 Milvus 记忆，并在回答后判断写入；独立学习 Graph 仍有模型可调用的记忆工具。下面是工具设计练习，不是正式入口的代码摘录。
 
 ```python
 # ✓ 新方案：把记忆读写封装为工具，让 Agent 自主调用
@@ -141,7 +140,7 @@ def recall_memory(query: str) -> str:
     return "\n".join(hit["entity"]["text"] for hit in res[0])
 ```
 
-**练习**：在 `tools.py` 中新增 `save_to_memory` 和 `recall_memory` 两个工具，接入现有 Milvus + bge 模型，让 Agent 跨会话记住重要结论。
+**练习**：比较正式业务图的自动召回与独立示例的工具召回，并检查可信身份、重复写入和召回质量；不要直接照搬示例函数作为多用户服务。
 
 ---
 
@@ -195,9 +194,9 @@ for chunk in llm.stream("解释什么是 Agent"):
 
 ---
 
-## Phase 6 — LangGraph 状态机 Agent
+## Phase 6 — LangGraph 状态机 Agent（业务图已合入）
 
-> LangChain 官方推荐的下一代 Agent 框架，`smith.py` 用的 `create_agent` 是过渡 API，**LangGraph 才是重点**。
+> 正式 `/chat` 已由 `chat_workflow.py` 的五阶段业务图编排，回答阶段仍复用 `create_agent()` 创建的内层 Agent。下面的代码是状态机练习，不对应正式图的节点命名或边界。
 
 ### 核心概念
 
@@ -238,7 +237,7 @@ graph.add_conditional_edges("start", route, {...})
 app = graph.compile()
 ```
 
-**改造目标**：把 `main.py` Agent Loop 重写成 LangGraph 版本，体会状态机的优势（可视化、断点、持久化）。
+**练习目标**：阅读正式业务图的召回、回答、候选判断、冲突决策和写入边界，再与独立示例比较状态和 checkpoint 的职责。
 
 ---
 
@@ -275,7 +274,7 @@ os.environ["LANGCHAIN_API_KEY"] = "your_key"
 
 ## Phase 9 — 生产部署
 
-已有 `fastapi`、`gradio`、`uvicorn` 依赖，但还没用上：
+正式项目已使用 FastAPI 提供 `/chat` 的 POST SSE 与 `/health`；下面的简化端点只是教学示意，不是现行 API 契约。Gradio 是否使用应另查具体入口。
 
 ### 9.1 FastAPI 封装 Agent
 
@@ -308,18 +307,11 @@ gr.ChatInterface(chat_fn).launch()
 ## 下一步优先级
 
 ```
-P0（本周）：
-  └── Phase 4.1  用 LangGraph MemorySaver checkpointer 改造 main.py（跳过旧版 Memory API）
-
-P1（本月）：
-  ├── Phase 5.1  with_structured_output 结构化输出
-  └── Phase 6    LangGraph 改造 Agent Loop
-
-P2（进阶）：
-  ├── Phase 7    Plan-and-Execute + Self-Reflection（直接服务幻觉研究主题）
-  └── Phase 8    LangSmith 接入，可视化追踪每轮推理
+P1：验证当前 JWT 与资源隔离；用真实 PostgreSQL、Milvus、模型完成正式 Graph 的双用户 SSE 联调。
+P2：建立请求级观测、召回与回答评测基线；对错误、延迟、token 和费用进行可重复统计。
+P3：在上述基线稳定后，比较 Plan-and-Execute、Self-Reflection 等策略是否改善质量。
 ```
 
 ---
 
-*生成时间：2026-09-12 · 基于项目实际代码分析*
+*初稿：2026-09-12 · 当前状态标注更新：2026-10-19*

@@ -40,6 +40,18 @@ OPENAI_BASE_URL=https://your-model-api.example/v1
 OPENAI_MODEL=your_model
 ```
 
+认证功能还要求以下配置。它使用 HS256，签名和验证密钥应为同一个高熵随机值；真实密钥仅放在未提交的本地配置中。
+
+```dotenv
+JWT_SIGNING_KEY=replace_with_a_random_secret
+JWT_VERIFYING_KEY=replace_with_the_same_random_secret
+JWT_ISSUER=agent-api
+JWT_AUDIENCE=agent-web
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=15
+```
+
+缺少这些 JWT 配置时 API 无法正常启动。
+
 启动 API：
 
 ```bash
@@ -50,11 +62,22 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 
 ```bash
 curl http://127.0.0.1:8000/health
+```
 
+`/chat` 需要先注册或登录，再用返回的 access token 请求：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"replace_with_a_strong_password"}'
+
+# 从注册响应的 access_token 复制令牌；已有账号可调用 /api/auth/login。
+ACCESS_TOKEN='paste_access_token_here'
 curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"user_id":"demo-user","session_id":"demo-session","message":"你好"}'
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -d '{"session_id":"demo-session","message":"你好"}'
 ```
 
 ## 工程细节
@@ -64,6 +87,8 @@ curl -N -X POST http://127.0.0.1:8000/chat \
 `/chat` 在调用 Agent 前为当前用户/会话获取 PostgreSQL 事务级 advisory lock，并持有到 `ChatLog` 提交；同一会话的并发请求由数据库串行化，跨 API worker 也共享此约束。不同会话使用不同锁键，可并行处理。
 
 正式聊天流程由 [请求级业务图](src/agent/chat_workflow.py) 编排召回、回答和长期记忆维护；图本身不另存 checkpoint。同步调用与 POST SSE 接口共享这些阶段，流式 token、断线停止和失败清理仍由原有 Agent 流处理。回答后的记忆维护失败会记录服务端异常并保留回答；节点与验证范围见 [迁移记录](docs/chat_graph_migration.md)。
+
+独立的 React 前端位于 `/Users/zhangweiwei/Desktop/code/web/my-app`。新版本的 `done` / `stopped` 事件附带 `chat_log_id`；页面可将回答问题或记忆问题提交到 `POST /api/feedback`，由服务端按当前用户验证记录归属。人工脱敏、回归样本提升及基线对比命令见 [反馈回归流程](docs/feedback_regression.md)。
 
 ## 验证会话恢复与隔离
 
@@ -79,17 +104,21 @@ python -m unittest discover -s tests -p 'test_memory_update.py'
 python -m unittest discover -s tests -p 'test_recall_routing.py'
 python -m unittest discover -s tests -p 'test_stream_recovery.py'
 python -m unittest discover -s tests -p 'test_chat_workflow.py'
+python -m unittest discover -s tests -p 'test_feedback_api.py'
+python -m unittest discover -s tests -p 'test_feedback_loop.py'
 ```
 
 `test_stream_recovery.py` 使用假模型验证 SSE 生成失败、checkpoint 清理、同会话重试，以及完整回答后记忆更新失败的边界。现有 `test_gemini.py`、`test_search.py` 等脚本可能在导入时访问外部服务，请使用上面的定向命令，避免直接执行全量 `unittest discover` 或 pytest 默认收集。
 
-GitHub Actions 会在每次 push 和 pull request 时自动运行以上五组离线回归，配置位于 `.github/workflows/offline-regression.yml`。这些工作流不连接真实模型、PostgreSQL 或 Milvus。
+GitHub Actions 会在每次 push 和 pull request 时自动运行以上七组离线回归，配置位于 `.github/workflows/offline-regression.yml`。这些工作流不连接真实模型、PostgreSQL 或 Milvus。
 
-以下为仓库原有的验证记录，本次 Graph 合并未重新执行这些集成验证：\n\n目前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
+以下为仓库原有的验证记录，不能代替当前认证和反馈流程的完整端到端验收。
+
+此前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。此前 FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
 
 ## 当前边界
 
-- 请求体中的 `user_id` 尚未通过身份认证。复合会话 ID 能防止不同用户意外共用同一 checkpoint，但调用方仍可伪造他人的 `user_id`；对外提供服务前，需要从可信认证上下文获取身份，并校验会话归属。
+- `/chat` 从 JWT `sub` 获取 `user_id`，路径、主题和任务接口加入了所有权检查；双用户端到端验收仍未完成。独立 Graph 示例的记忆工具仍需可信身份绑定；不能仅凭复合线程 ID 断言整个项目已完成访问控制。
 - 旧版 `InMemorySaver` 中的历史不会自动迁移到 PostgreSQL；新部署从新的 checkpoint 开始。
 - 当前 `/chat` 用 PostgreSQL advisory lock 串行化同一会话；锁等待超时、高并发延迟和多进程效果仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
 - `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/chat` 的验收结果。
@@ -99,6 +128,9 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上五组离
 - [问题与改进 TODO](docs/TODO.md)：问题状态、验收条件和后续工作。
 - [自动召回学习文档](docs/auto_recall.md)：长期记忆读取、向量检索与 Graph 改造。
 - [聊天业务图](docs/graph.md) 与 [迁移记录](docs/chat_graph_migration.md)：正式流程的节点、失败边界和验证。
+- [JWT 学习与集成指南](docs/jwt_auth.md)：JWT 基础、项目身份边界和分阶段集成方案。
 - [学习进度路线](docs/learning_progress_roadmap.md) 与 [Agent 学习路线](docs/agent_learning_roadmap.md)：分阶段学习计划。
+- [网关基建与评测路线](docs/gateway_evaluation_roadmap.md)：API、模型与工具边界，以及运行和质量指标。
+- [反馈回归流程](docs/feedback_regression.md)：用户负反馈的审核、脱敏和版本对比。
 
 主要代码入口为 [API](api/server.py)、[Agent](src/agent/main.py)、[记忆工具](src/agent/tools.py) 和 [独立 Graph 示例](src/agent/graph.py)。

@@ -1,8 +1,8 @@
 # 自动召回：从当前代码理解 Agent 的长期记忆
 
-本文基于 2026-10-03 的项目代码，围绕 `main.py → tools.py → Milvus → Agent` 解释自动召回。阅读目标是：能画出调用流程、解释每个参数、判断问题出在哪一层，并能设计验证召回效果的实验。
+本文保留 2026-10-03 的召回策略讲解，并按 2026-10-19 的主入口补充业务 Graph 和身份边界。正式调用链为 `chat_workflow.py` 的 `recall` 节点 → `main.py` 的召回函数 → `tools.py` / Milvus → Agent。阅读目标是：能画出调用流程、解释每个参数、判断问题出在哪一层，并能设计验证召回效果的实验。
 
-**文档中的“当前实现”描述已有代码；“建议改造”尚未实现。** 已确认的缺陷和验收任务见 [项目 TODO](TODO.md)。已有的 [Agent 学习路线](agent_learning_roadmap.md) 中部分代码描述早于当前实现，涉及本项目记忆逻辑时以源码和本文为准。
+**第 4～9 节解释仍在正式业务图中复用的召回与记忆函数；第 10 节只讨论独立学习 Graph 的后续改造。** 已确认的缺陷和验收任务见 [项目 TODO](TODO.md)。[正式业务图说明](graph.md) 与 [迁移记录](chat_graph_migration.md) 给出当前 API 的编排和失败边界。
 
 阅读导航：
 
@@ -38,7 +38,7 @@
 | 短期会话历史 | “这一轮之前聊了什么？” | 主 API 的 PostgreSQL checkpoint；独立 Graph 示例仍用 `InMemorySaver` | 主 API 可跨重启恢复；Graph 示例只保留在当前进程 |
 | 用户长期记忆 | “这个用户有什么长期偏好、目标和背景？” | Milvus 的 `agent_memory` | 按用户存储；能否保留取决于数据库存储和部署配置 |
 | 内部知识库 | “文档中有什么知识？” | Milvus 的 `demo_collection` | 文档内容；不等于个人聊天历史 |
-| 自动召回 | “回答之前，要由程序先读取哪些记忆？” | `main.chat()` 按类别调用 `_get_memories_by_keys()`，或走 `_recall_memories()` 向量兜底 | 程序控制时机，不依赖模型先发出工具调用 |
+| 自动召回 | “回答之前，要由程序先读取哪些记忆？” | 正式业务图的 `recall` 节点复用 `main.py` 的类别读取与向量兜底函数 | 程序控制时机，不依赖模型先发出工具调用 |
 | 工具召回 | “模型推理过程中还需要找什么记忆？” | `search_memory` 工具；当前只注册在独立 `smith.py` Agent | 主 API 未注册该工具；Graph 路线的模型可选择调用，但身份绑定仍待修复 |
 
 还要区分三个 ID：
@@ -49,13 +49,14 @@
 | `session_id` | 用户的一次对话 | 属于特定用户，不能只凭客户端传来的字符串认定归属 |
 | `thread_id` | Checkpointer 保存和恢复状态的键 | 必须隔离用户与会话；同一用户不同会话也应有不同键 |
 
-跨会话召回依靠同一个用户的长期记忆，不需要让不同会话共用 `thread_id`。主 API 现在由 `make_thread_id(user_id, session_id)` 生成无歧义的复合线程 ID；相同用户与会话可继续，同名会话但不同用户会分开。这个设计依赖传入的 `user_id`，当前 API 尚未认证该值，不能把线程隔离当成访问控制。独立 Graph 示例还未使用这套 ID 规则。
+跨会话召回依靠同一个用户的长期记忆，不需要让不同会话共用 `thread_id`。主 API 由 `make_thread_id(user_id, session_id)` 生成无歧义的复合线程 ID；相同用户与会话可继续，同名会话但不同用户会分开。当前 API 代码从 JWT `sub` 获取 `user_id`，仍需双用户端到端隔离验收；独立 Graph 示例还未使用这套 ID 规则。
 
 ## 3. 从哪些文件开始读
 
 | 文件与函数 | 阅读重点 |
 | --- | --- |
-| [main.py](../src/agent/main.py)：`chat` | 回答前召回、上下文拼接、调用 Agent、回答后判断是否保存 |
+| [chat_workflow.py](../src/agent/chat_workflow.py)：`build_chat_workflow` | 正式入口的召回、回答和记忆维护节点及失败边界 |
+| [main.py](../src/agent/main.py)：`chat`、`chat_stream` | 同步与流式入口、回答前召回函数及动态提示 |
 | [main.py](../src/agent/main.py)：`should_recall_memory` | 当前基于关键词的召回开关 |
 | [checkpoint.py](../src/agent/checkpoint.py)：`make_thread_id`、`checkpoint_dsn` | 会话线程隔离，以及把现有 PostgreSQL URL 转为 checkpoint 连接串 |
 | [server.py](../api/server.py)：`lifespan` | 创建、初始化并关闭主 API 的 PostgreSQL checkpoint 连接池和 Agent |
@@ -67,7 +68,7 @@
 
 项目存在两条独立实现：
 
-- **`main.py` 路线**：有回答前程序控制的自动召回；主 Agent 的工具列表没有 `search_memory`，回答时不能主动调用该工具。回答生成后处理长期记忆写入。API 通过 `src.agent.main` 使用这条路线，并以 PostgreSQL 保存其短期会话历史。
+- **正式业务图路线**：`main.py` 的 `chat()` 与 `chat_stream()` 调用 `chat_workflow.py`；回答前由程序控制自动召回，主 Agent 的工具列表没有 `search_memory`。回答后图继续判断和维护长期记忆；内层 Agent 以 PostgreSQL 保存短期会话历史。
 - **`graph.py` 路线**：先进入 `agent` 节点，再判断是否保存、检索旧记录、解决冲突、写入。它还没有回答前的自动召回节点，但其内部 `smith.py` Agent 注册了 `search_memory`。`search_existing_memory` 是写入前检索，不能理解为回答前召回。此入口仍使用内存 checkpoint。
 
 不要因为两条路线都调用了搜索函数，就认为它们已经具有相同的记忆行为。
@@ -102,12 +103,24 @@ flowchart TD
     Q --> R
 ```
 
-这张图反映的是当前 `main.chat()` 的同步调用顺序。
+这张图展示正式业务图中仍复用的召回和记忆函数；真实节点边界为 `recall → answer → judge → resolve → persist`，同步 `chat()` 和流式 `chat_stream()` 都运行这套图。
 
 1. 先运行关键词门控；门控为 `False` 时不执行回答前的规则、LLM 或向量查询。显式回忆问句可放行，即使没有具体主题。门控为 `True` 时，类别规则只对少数完整的本人事实问句（如“我现在做什么工作？”）直接给出类别；其他句式交给 LLM。LLM 认为不需要记忆则跳过，认为需要且给出类别则精确读取，认为需要但类别为空才用向量 Top-5 兜底。本轮新事实即使尚未写库，模型也能从当前用户消息看到。
-2. `agent.invoke()` 完成之后，仍然会调用 `judge_memory()`；有旧记忆时一次调用 `resolve_memories()` 批量判断，并在校验结果后写入。
-3. 直到这些步骤结束，函数才执行 `return`。因此“回答已经生成”不等于“用户已经收到回答”。当前记忆写入阶段的异常仍可能让整个聊天请求失败。
+2. `answer` 节点调用带 checkpoint 的 Agent；流式入口会在该节点逐个发送 token。随后 `judge` 判断候选，`resolve` 批量决策，`persist` 执行写入。
+3. 回答后的记忆阶段若失败，正式图记录服务端异常并保留已生成的回答；召回或回答失败仍会使请求失败。流式客户端可能先收到部分 token，随后才收到 `error` 事件。
 4. 门控未命中或 LLM 明确否决时，主 API 跳过**回答前召回**；其 Agent 未注册 `search_memory`，不会在回答期间通过该工具补查。这不禁止回答后的 `judge_memory()` 为更新候选事实读取同类别旧记录。独立 Graph 入口的工具行为不同。
+
+### 回答后的自动存储（2026-10-19 更新）
+
+正式业务图的 `judge` 阶段仅跳过空消息。其他消息均交给提取模型判断，不再用关键词或问号拦截。模型只提取用户明确陈述、未来对话仍有用的个人事实；纯提问、闲聊、假设、引用或第三人称事实应返回 `memories=[]`。因此每条非空消息会多一次提取判断，提取质量仍需结合实际模型评测。
+
+在原有类别之外，新增 `user_name`（姓名）、`preferred_name`（希望被如何称呼）、`personal_background`（不属于已有类别的长期个人背景）。例如“OK。我叫张三。我喜欢吃西瓜”应提取姓名与饮食两个候选；“我叫张三，你记住了吗？”也应提取姓名。姓名与称呼独立保存，改名或改称呼交给现有冲突决策更新对应旧记录。
+
+`resolve` 继续按服务端用户身份和类别读取旧记录，`persist` 执行新增、替换或忽略重复。Milvus 的 `memory_key` 本来就是字符串字段，无需重建集合。新增日志 `[Memory Extract] candidate_keys=` 显示提取类别（空列表表示无候选），`[Memory Persist] insert/replace succeeded` 只在写入调用成功返回后输出；`unchanged` 表示无需写入，异常仍由服务端错误日志记录。新增日志不输出记忆正文。
+
+姓名和称呼的常见问句已补齐召回门控和精确类别路由。例如“我叫什么”“你知道我叫什么了吗”按同用户的 `user_name` 读取，不依赖向量相似度阈值。重启服务加载新代码后，需要重新发送此前未保存的事实；修改不会回填历史聊天。先等本轮流式 `done` 事件再开新会话验证，避免回答后的存储尚未完成。
+
+离线回归使用模拟模型、嵌入和 Milvus，验证实际提取入口、业务图、写入及读取函数的衔接；并不证明线上模型对所有表达均能正确分类。运行：`python -m unittest discover -s tests -p 'test_memory_update.py' -v` 与 `python -m unittest discover -s tests -p 'test_recall_routing.py' -v`。
 
 ## 5. 第一步：判断是否需要预召回
 
@@ -216,7 +229,7 @@ results = client.search(
 
 过滤表达式由 Milvus 在检索时使用，而不是先取全库 Top-5 再由 Python 丢掉其他用户。后者既可能泄露信息，也可能让本来存在的相关结果被其他用户占掉名额。
 
-不过，**有过滤表达式不等于完成了身份认证**。当前 API 的 `user_id` 是请求字段，工具参数中的 `user_id` 也暴露给模型。建议从可信运行时绑定身份，并使用受支持的过滤参数模板，或严格限制和转义标识符，避免直接拼接未经验证的输入。具体 API 需匹配安装的 SDK 版本。[Milvus 过滤说明](https://milvus.io/docs/filtered-search.md)
+不过，**有过滤表达式不等于完成了身份认证**。当前正式 API 代码从 JWT 取得 `user_id`；独立示例的工具参数仍可能由模型提供用户标识，且整体隔离尚未端到端验收。应从可信运行时绑定身份，并使用受支持的过滤参数模板，或严格限制和转义标识符，避免直接拼接未经验证的输入。具体 API 需匹配安装的 SDK 版本。[Milvus 过滤说明](https://milvus.io/docs/filtered-search.md)
 
 ### 7.2 Top-K 只限制候选数量
 
@@ -267,7 +280,7 @@ if score < min_score:
 - [learning_direction] 用户希望补充后端基础。
 ```
 
-随后与当前用户 ID、时间、使用规则组成本轮系统提示，通过 `agent.invoke(..., context={"system_prompt": ...})` 交给 `dynamic_prompt` 中间件。这个动态提示只在本轮模型调用时注入，不会作为消息累计到 PostgreSQL checkpoint；checkpoint 保存的是对话消息。规则强调：只用相关记忆、不强行套用、当前用户明确表达的信息优先、不根据旧记忆自行推测。
+随后与当前用户 ID、时间、使用规则组成本轮系统提示，交给 `dynamic_prompt` 中间件；同步 `answer` 节点使用 `agent.invoke()`，流式节点使用 `agent.astream()`。这个动态提示只在本轮模型调用时注入，不会作为消息累计到 PostgreSQL checkpoint；checkpoint 保存的是对话消息。规则强调：只用相关记忆、不强行套用、当前用户明确表达的信息优先、不根据旧记忆自行推测。
 
 没有结果时，无论是门控未触发、库中没有候选，还是所有候选低于阈值，当前提示词都使用“暂无相关长期记忆。”。这段话仅描述本次上下文，不应被回答模型扩大理解为“数据库里没有关于该用户的任何信息”。
 
@@ -306,9 +319,11 @@ if score < min_score:
 
 <a id="graph-design"></a>
 
-## 10. 在 Graph 中加入自动召回：建议结构
+## 10. 独立学习 Graph 的自动召回改造练习
 
-当前 Graph 的顺序是：
+正式 `/chat` 已通过请求级业务图的 `recall` 节点实现回答前召回。下面只讨论尚未与 API 统一的独立 [graph.py](../src/agent/graph.py) 学习示例，不是正式入口的待合入方案。
+
+独立学习 Graph 当前的顺序是：
 
 ```text
 START → agent → memory_judge
@@ -330,7 +345,7 @@ flowchart LR
     P --> E
 ```
 
-状态可按以下思路设计。**下面只是改造片段，当前仓库尚未采用，也不是完整可运行替换文件。**
+独立示例的状态可按以下思路设计。**下面只是该示例的改造片段，不是正式业务图的状态定义，也不是完整可运行替换文件。**
 
 ```python
 from typing import Annotated, TypedDict
@@ -346,7 +361,7 @@ class RecallState(TypedDict):
 
 关键设计：
 
-- `messages` 用消息合并规则维护历史。当前普通 `list` 会在新一轮传入消息时覆盖历史。
+- `messages` 用消息合并规则维护历史。独立示例当前的普通 `list` 会在新一轮传入消息时覆盖历史。
 - `recalled_memories` 保存本轮结果，采用覆盖语义；每轮都写入新列表，跳过或无结果时明确写入 `[]`，防止沿用上一轮记忆。
 - `recall_status` 区分 `skipped`、`hit`、`empty`、`unavailable` 等状态；这是建议新增的可观测性字段。
 - 召回 Query 应来自本轮用户输入，或由历史明确改写出的查询，不要错误地取上一条 AI 回复。
@@ -561,7 +576,7 @@ PY
 
 ## 16. 建议的学习顺序
 
-1. 阅读 `main.chat()`，标出回答前的读取和回答后的写入，手画完整时序。
+1. 阅读 `chat_workflow.py` 的节点和 `main.py` 的召回函数，标出回答前的读取与回答后的写入，手画完整时序。
 2. 运行第 11 节离线实验，加入新的门控样本，解释每个布尔结果。
 3. 修改实验的候选分数，理解 Top-K、边界值与阈值的区别。
 4. 用替身存储复现新增两条同类记忆、替换指定 ID 的行为；再用隔离的真实 Milvus 验证兼容性。

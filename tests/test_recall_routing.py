@@ -202,6 +202,24 @@ class RecallRoutingTests(unittest.TestCase):
         )
         self.vector_query.assert_not_called()
 
+    def test_name_and_preferred_name_questions_use_scoped_exact_lookup(self):
+        for message, key in (
+            ("我叫什么", "user_name"),
+            ("你知道我叫什么吗", "user_name"),
+            ("你知道我叫什么了吗", "user_name"),
+            ("我的名字是什么？", "user_name"),
+            ("你应该怎么称呼我？", "preferred_name"),
+        ):
+            with self.subTest(message=message):
+                self.agent.invoke.reset_mock()
+                self.exact_query.reset_mock()
+                self.exact_query.return_value = [{"memory_key": key, "memory": "用户叫张三"}]
+                self.assertTrue(self.namespace["should_recall_memory"](message))
+                self.chat(message, expected_memory="用户叫张三")
+                self.exact_query.assert_called_once_with(user_id="user-a", memory_keys=[key])
+        self.router_model.invoke.assert_not_called()
+        self.vector_query.assert_not_called()
+
     def test_llm_known_category_uses_one_exact_query(self):
         self.router_decision(True, ["food_preference"])
         memory = "用户喜欢清淡饮食"

@@ -37,7 +37,18 @@ OPENAI_BASE_URL=https://your-model-api.example/v1
 OPENAI_MODEL=your_model
 ```
 
+Authentication also requires these values. The HS256 signing and verification keys should be the same high-entropy random secret.
+
+```dotenv
+JWT_SIGNING_KEY=replace_with_a_random_secret
+JWT_VERIFYING_KEY=replace_with_the_same_random_secret
+JWT_ISSUER=agent-api
+JWT_AUDIENCE=agent-web
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=15
+```
+
 Replace placeholders locally. Do not commit real credentials. The database account needs permission to create checkpoint tables on first startup. [checkpoint.py](src/agent/checkpoint.py) converts the SQLAlchemy asyncpg URL into a psycopg connection string for the same PostgreSQL database.
+The API requires JWT settings at startup; keep real secrets out of Git.
 
 ```bash
 python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
@@ -47,10 +58,22 @@ First startup initializes the API tables and LangGraph checkpoint tables. A Post
 
 ```bash
 curl http://127.0.0.1:8000/health
+```
+
+Register or log in first, then send the returned access token to `/chat`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"replace_with_a_strong_password"}'
+
+# Copy access_token from the response. Existing users can call /api/auth/login.
+ACCESS_TOKEN='paste_access_token_here'
 curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
-  -d '{"user_id":"demo-user","session_id":"demo-session","message":"Hello"}'
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -d '{"session_id":"demo-session","message":"Hello"}'
 ```
 
 ## Engineering details
@@ -62,6 +85,7 @@ curl -N -X POST http://127.0.0.1:8000/chat \
 - Startup creates the PostgreSQL pool and agent; shutdown releases the pool. Each turn submits only the current user message. Recalled content is injected into a dynamic system prompt rather than accumulated in persisted message history. Agent replies and tool messages are persisted by checkpoints. `ChatLog` records question/answer pairs and does not restore checkpoint state.
 - Before invoking the agent, `/chat` acquires a transaction-level advisory lock for the conversation and holds it through the `ChatLog` commit. The database serializes requests for the same conversation across workers; different conversations use different lock keys.
 - The [request-scoped chat graph](src/agent/chat_workflow.py) coordinates recall, answering, and memory updates for both synchronous and POST SSE calls. The inner agent retains PostgreSQL checkpoints. Post-answer memory failures are logged while the completed answer is returned; see the [migration record](docs/chat_graph_migration.md).
+- `done` and `stopped` events include `chat_log_id`. The separate React frontend in `/Users/zhangweiwei/Desktop/code/web/my-app` can submit answer or memory feedback to `POST /api/feedback`; see the [review and regression workflow](docs/feedback_regression.md). That frontend is outside this Git repository.
 
 ## Verification
 
@@ -79,17 +103,19 @@ python -m unittest discover -s tests -p 'test_memory_update.py'
 python -m unittest discover -s tests -p 'test_recall_routing.py'
 python -m unittest discover -s tests -p 'test_stream_recovery.py'
 python -m unittest discover -s tests -p 'test_chat_workflow.py'
+python -m unittest discover -s tests -p 'test_feedback_api.py'
+python -m unittest discover -s tests -p 'test_feedback_loop.py'
 ```
 
 `test_stream_recovery.py` uses fake models to cover SSE generation failure, checkpoint cleanup, same-conversation retries, and memory-update failures after a complete answer. Other scripts, including `test_gemini.py` and `test_search.py`, may access external services during import. Use targeted commands instead of unfiltered test discovery.
 
-[GitHub Actions](.github/workflows/offline-regression.yml) runs these five offline suites on pushes and pull requests, without connecting to real models, PostgreSQL, or Milvus.
+[GitHub Actions](.github/workflows/offline-regression.yml) runs these seven offline suites on pushes and pull requests, without connecting to real models, PostgreSQL, or Milvus.
 
-**Existing repository verification record — not rerun for this Graph merge:** checkpoint initialization was exercised in a temporary schema on real PostgreSQL. A fake chat model completed two turns; after closing and recreating the pool, four human/AI messages were recovered. The temporary schema was removed. FastAPI lifespan startup and `/health` returned HTTP 200 with a connected database. Two real database sessions confirmed that a second request for the same advisory lock waits for the first transaction to commit. Full `/chat`, real-model/Milvus integration, cross-user isolation, and concurrent load still require integration testing.
+**Existing repository verification record — not a full acceptance test of current authentication and feedback:** checkpoint initialization was exercised in a temporary schema on real PostgreSQL. A fake chat model completed two turns; after closing and recreating the pool, four human/AI messages were recovered. The temporary schema was removed. FastAPI lifespan startup and `/health` returned HTTP 200 with a connected database. Two real database sessions confirmed that a second request for the same advisory lock waits for the first transaction to commit. Full `/chat`, real-model/Milvus integration, cross-user isolation, and concurrent load still require integration testing.
 
 ## Known limitations
 
-- Request-body `user_id` is not authenticated. Composite identities avoid accidental sharing but do not prevent impersonation. A public service must derive identity from trusted authentication and check conversation ownership.
+- `/chat` derives identity from the JWT `sub` claim, and path, topic, and task APIs check ownership. These changes have not passed two-user end-to-end acceptance. The standalone graph example still needs trusted identity binding for memory tools; composite thread IDs alone do not establish project-wide access control.
 - Old `InMemorySaver` history is not migrated; new deployments start with new checkpoints.
 - Lock wait timeouts, high-concurrency latency, and multi-process behavior need load testing. Checkpoint writes and `ChatLog` commits use separate connections and transactions: checkpoint state may advance even when log persistence fails. Compensation or retry behavior remains to be defined.
 - [graph.py](src/agent/graph.py) is a separate learning entry point and is not unified with the API persistence flow. Its examples are not acceptance evidence for `/chat`.
