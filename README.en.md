@@ -69,12 +69,22 @@ curl -X POST http://127.0.0.1:8000/api/auth/register \
 
 # Copy access_token from the response. Existing users can call /api/auth/login.
 ACCESS_TOKEN='paste_access_token_here'
+# Create a session and copy data.id from the response.
+curl -X POST http://127.0.0.1:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -d '{"title":"First conversation"}'
+SESSION_ID='paste_session_uuid_here'
+# Reuse request_id only when retransmitting exactly the same request.
+REQUEST_ID=$(python -c 'import uuid; print(uuid.uuid4())')
 curl -N -X POST http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-  -d '{"session_id":"demo-session","message":"Hello"}'
+  -d "{\"session_id\":\"${SESSION_ID}\",\"request_id\":\"${REQUEST_ID}\",\"message\":\"Hello\"}"
 ```
+
+**API contract change (2026-10-26):** create a session before calling `/chat`, and supply `request_id`. The existing React frontend has not yet been adapted. This delivery covers backend persistence, not the history UI; see the [change map and verification](docs/session_storage_delivery.md).
 
 ## Engineering details
 
@@ -83,7 +93,7 @@ curl -N -X POST http://127.0.0.1:8000/chat \
 - The client sends POST JSON with `fetch` and reads the response stream; native browser `EventSource` cannot send this POST body.
 - [main.py](src/agent/main.py) uses `make_thread_id(user_id, session_id)` to produce stable, unambiguous checkpoint identities. Reusing a session ID across different users does not accidentally share short-term history.
 - Startup creates the PostgreSQL pool and agent; shutdown releases the pool. Each turn submits only the current user message. Recalled content is injected into a dynamic system prompt rather than accumulated in persisted message history. Agent replies and tool messages are persisted by checkpoints. `ChatLog` records question/answer pairs and does not restore checkpoint state.
-- Before invoking the agent, `/chat` acquires a transaction-level advisory lock for the conversation and holds it through the `ChatLog` commit. The database serializes requests for the same conversation across workers; different conversations use different lock keys.
+- `/chat` validates session ownership and acquires a session-level advisory lock from a dedicated pool for the full response lifetime. Overlapping requests for the same session return 409. User/assistant placeholders are committed before generation; terminal status and compatible `ChatLog` are committed before `done`/`stopped`. The request ID prevents duplicate generation on retransmission.
 - The [request-scoped chat graph](src/agent/chat_workflow.py) coordinates recall, answering, and memory updates for both synchronous and POST SSE calls. The inner agent retains PostgreSQL checkpoints. Post-answer memory failures are logged while the completed answer is returned; see the [migration record](docs/chat_graph_migration.md).
 - `done` and `stopped` events include `chat_log_id`. The separate React frontend in `/Users/zhangweiwei/Desktop/code/web/my-app` can submit answer or memory feedback to `POST /api/feedback`; see the [review and regression workflow](docs/feedback_regression.md). That frontend is outside this Git repository.
 
@@ -93,7 +103,7 @@ With temporary conversation content:
 
 1. Send two related messages as user A in session S and check context continuity.
 2. Restart the API and continue A/S; check persisted checkpoint tables and recovered context.
-3. Try B/S and A/T and confirm they do not read A/S short-term history.
+3. B/S must return 404; create a separate session T for A and confirm it does not read A/S short-term history.
 
 Avoid long-term memory save/recall confounding checkpoint isolation tests. Targeted offline regressions:
 
@@ -105,11 +115,14 @@ python -m unittest discover -s tests -p 'test_stream_recovery.py'
 python -m unittest discover -s tests -p 'test_chat_workflow.py'
 python -m unittest discover -s tests -p 'test_feedback_api.py'
 python -m unittest discover -s tests -p 'test_feedback_loop.py'
+python -m unittest discover -s tests -p 'test_chat_storage.py'
+python -m unittest discover -s tests -p 'test_chat_persistence.py'
+python -m unittest discover -s tests -p 'test_chat_api.py'
 ```
 
 `test_stream_recovery.py` uses fake models to cover SSE generation failure, checkpoint cleanup, same-conversation retries, and memory-update failures after a complete answer. Other scripts, including `test_gemini.py` and `test_search.py`, may access external services during import. Use targeted commands instead of unfiltered test discovery.
 
-[GitHub Actions](.github/workflows/offline-regression.yml) runs these seven offline suites on pushes and pull requests, without connecting to real models, PostgreSQL, or Milvus.
+[GitHub Actions](.github/workflows/offline-regression.yml) runs these ten offline suites on pushes and pull requests, without connecting to real models, PostgreSQL, or Milvus.
 
 **Existing repository verification record — not a full acceptance test of current authentication and feedback:** checkpoint initialization was exercised in a temporary schema on real PostgreSQL. A fake chat model completed two turns; after closing and recreating the pool, four human/AI messages were recovered. The temporary schema was removed. FastAPI lifespan startup and `/health` returned HTTP 200 with a connected database. Two real database sessions confirmed that a second request for the same advisory lock waits for the first transaction to commit. Full `/chat`, real-model/Milvus integration, cross-user isolation, and concurrent load still require integration testing.
 

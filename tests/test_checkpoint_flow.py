@@ -240,98 +240,54 @@ class ChatCheckpointTests(unittest.TestCase):
 
 class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_endpoint_streams_and_commits_after_agent_completion(self):
-        from src.agent.checkpoint import checkpoint_lock_id
-        from starlette.responses import StreamingResponse
+        import uuid
+        from api.chat_storage import begin_turn
+        from api.chat_stream import persisted_chat_response
+        from api.models import ChatLog, ChatMessage
+        from test_chat_storage import ChatStorageTests
 
-        started_agent = object()
-        events = []
-        chat_calls = []
+        await ChatStorageTests.asyncSetUp(self)
+        try:
+            turn = await begin_turn(self.db, self.owner, self.session.id, uuid.uuid4(), "你好")
+            calls = []
+            agent = object()
 
-        async def fake_chat_stream(*, message, user_id, session_id, agent, on_token, callbacks):
-            events.append("chat")
-            chat_calls.append((message, user_id, session_id, agent, callbacks))
-            await on_token("一段")
-            return "done", "完整回答"
+            async def model(**kwargs):
+                calls.append(kwargs)
+                await kwargs["on_token"]("一段")
+                return "done", "完整回答"
 
-        class FakeUsageCallback:
-            usage_metadata = {}
-
-        def fake_usage_payload(callback):
-            return {
-                "available": True,
-                "models": {"fake-model": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}},
-                "input_tokens": 10,
-                "output_tokens": 3,
-                "total_tokens": 13,
+            namespace = {
+                "Depends": lambda *args, **kwargs: None,
+                "get_chat_turn": lambda: None,
+                "persisted_chat_response": persisted_chat_response,
+                "chat_stream": model,
+                "_usage_payload": lambda callback: {"available": False},
             }
-
-        class FakeDB:
-            def __init__(self):
-                self.added = []
-                self.commits = 0
-                self.executions = []
-
-            async def execute(self, statement, params):
-                events.append("lock")
-                self.executions.append((statement, params))
-
-            def add(self, value):
-                events.append("add_log")
-                self.added.append(value)
-
-            async def commit(self):
-                events.append("commit")
-                self.commits += 1
-
-        app = SimpleNamespace(state=SimpleNamespace(agent=started_agent))
-        namespace = {
-            "asyncio": asyncio,
-            "json": json,
-            "chat_stream": fake_chat_stream,
-            "UsageMetadataCallbackHandler": FakeUsageCallback,
-            "_usage_payload": fake_usage_payload,
-            "StreamingResponse": StreamingResponse,
-            "Depends": lambda dependency: None,
-            "get_current_user": lambda: None,
-            "get_db": lambda: None,
-            "Request": object,
-            "sys": __import__("sys"),
-            "logger": SimpleNamespace(exception=lambda *args, **kwargs: None),
-            "ChatLog": lambda **values: SimpleNamespace(**values),
-            "text": lambda statement: statement,
-            "checkpoint_lock_id": checkpoint_lock_id,
-        }
-        endpoint = load_function(ROOT / "api/server.py", "chat_api", namespace)
-        db = FakeDB()
-        request = SimpleNamespace(message="你好", session_id="s1", user_id="spoofed")
-        http_request = SimpleNamespace(app=app)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = await endpoint(request, http_request, {"user_id": "alice"}, db)
-
-        self.assertIsInstance(result, StreamingResponse)
-        frames = [frame async for frame in result.body_iterator]
-        body = "".join(
-            frame.decode() if isinstance(frame, bytes) else frame for frame in frames
-        )
-        self.assertIn('event: token\ndata: {"content": "一段"}', body)
-        self.assertIn('event: usage\ndata: {"available": true', body)
-        done_frame = next(frame for frame in body.split("\n\n") if frame.startswith("event: done\n"))
-        done_payload = json.loads(done_frame.split("data: ", 1)[1])
-        self.assertEqual(done_payload["answer"], "完整回答")
-        self.assertEqual(done_payload["chat_log_id"], str(db.added[0].id))
-        self.assertEqual(events, ["lock", "chat", "add_log", "commit"])
-        self.assertEqual(len(db.executions), 1)
-        statement, params = db.executions[0]
-        self.assertIn("pg_advisory_xact_lock", statement)
-        self.assertEqual(params, {"lock_id": checkpoint_lock_id("alice", "s1")})
-        self.assertEqual(len(chat_calls), 1)
-        self.assertEqual(chat_calls[0][:4], ("你好", "alice", "s1", started_agent))
-        self.assertEqual(db.commits, 1)
-        self.assertEqual(len(db.added), 1)
-        self.assertEqual(db.added[0].user_id, "alice")
-        self.assertEqual(db.added[0].session_id, "s1")
-        self.assertEqual(db.added[0].answer, "完整回答")
+            endpoint = load_function(ROOT / "api/server.py", "chat_api", namespace)
+            http_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=agent)))
+            response = await endpoint(SimpleNamespace(), http_request, turn)
+            frames = []
+            async for frame in response.body_iterator:
+                frames.append(frame)
+                if frame.startswith("event: done"):
+                    async with self.factory() as reader:
+                        self.assertIsNotNone(await reader.get(ChatLog, turn.assistant_id))
+                        row = await reader.get(ChatMessage, turn.assistant_id)
+                        self.assertEqual(row.status, "completed")
+            body = "".join(frames)
+            self.assertIn('event: token\ndata: {"content": "一段"}', body)
+            self.assertIn('event: usage', body)
+            done = next(frame for frame in frames if frame.startswith("event: done"))
+            payload = json.loads(done.split("data: ", 1)[1])
+            self.assertEqual(payload["answer"], "完整回答")
+            self.assertEqual(payload["chat_log_id"], str(turn.assistant_id))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["user_id"], str(self.owner))
+            self.assertEqual(calls[0]["session_id"], str(self.session.id))
+            self.assertIs(calls[0]["agent"], agent)
+        finally:
+            await ChatStorageTests.asyncTearDown(self)
 
 
 class TokenUsagePayloadTests(unittest.TestCase):
@@ -381,7 +337,7 @@ class TokenUsagePayloadTests(unittest.TestCase):
 
 
 class LifespanTests(unittest.IsolatedAsyncioTestCase):
-    def build_fixture(self, *, setup_fails=False):
+    def build_fixture(self, *, setup_fails=False, lock_pool_open_fails=False):
         from src.agent.checkpoint import CHECKPOINT_SETUP_LOCK_ID
 
         events = []
@@ -415,10 +371,13 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, **kwargs):
                 configured.update(kwargs)
                 events.append("pool_create")
+                self.is_lock_pool = events.count("pool_create") == 2
 
             async def open(self, *, wait):
                 self.wait = wait
                 events.append("pool_open")
+                if self.is_lock_pool and lock_pool_open_fails:
+                    raise RuntimeError("lock pool failed")
 
             async def close(self):
                 events.append("pool_close")
@@ -468,6 +427,7 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.state.agent, agent)
             self.assertEqual(events.count("saver_setup"), 1)
             self.assertNotIn("pool_close", events)
+            self.assertEqual(events.count("pool_create"), 2)
 
         self.assertEqual(configured["conninfo"], "postgresql://u:p@h/db")
         event_names = [item[0] if isinstance(item, tuple) else item for item in events]
@@ -489,6 +449,15 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("pool_open"), events.index("saver_setup"))
         self.assertLess(events.index("saver_setup"), events.index("build_agent"))
         self.assertLess(events.index("build_agent"), events.index("pool_close"))
+        self.assertEqual(events[-1], "engine_dispose")
+
+    async def test_lock_pool_open_failure_closes_both_pools(self):
+        manager, app, events, *_ = self.build_fixture(lock_pool_open_fails=True)
+        with self.assertRaisesRegex(RuntimeError, "lock pool failed"):
+            async with manager:
+                pass
+        self.assertNotIn("build_agent", events)
+        self.assertEqual(events.count("pool_close"), 2)
         self.assertEqual(events[-1], "engine_dispose")
 
     async def test_failed_checkpoint_setup_still_closes_pool_and_engine(self):

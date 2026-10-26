@@ -206,10 +206,16 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(memory_updates), 1)
 
     async def test_api_sends_sse_error_without_chatlog_then_retry_commits(self):
-        calls = 0
-        chatlog_rows = []
+        from api.chat_storage import begin_turn
+        from api.chat_stream import persisted_chat_response
+        from api.models import ChatLog, ChatMessage
+        from sqlalchemy import select
+        from test_chat_storage import ChatStorageTests
 
-        async def fake_chat_stream(**kwargs):
+        await ChatStorageTests.asyncSetUp(self)
+        calls = 0
+
+        async def model(**kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -217,68 +223,24 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("simulated stream failure")
             return "done", "重试成功"
 
-        class FakeUsage:
-            def __init__(self):
-                self.usage_metadata = {}
-
-        class FakeDB:
-            def __init__(self):
-                self.added = []
-                self.commits = 0
-                self.rollbacks = 0
-
-            async def execute(self, statement, params):
-                return None
-
-            def add(self, row):
-                self.added.append(row)
-                chatlog_rows.append(row)
-
-            async def commit(self):
-                self.commits += 1
-
-            async def rollback(self):
-                self.rollbacks += 1
-
-        namespace = {
-            "asyncio": asyncio,
-            "json": json,
-            "sys": __import__("sys"),
-            "logger": logging.getLogger("stream-recovery-test"),
-            "chat_stream": fake_chat_stream,
-            "UsageMetadataCallbackHandler": FakeUsage,
-            "_usage_payload": lambda callback: {"available": False},
-            "StreamingResponse": StreamingResponse,
-            "Depends": lambda dependency: None,
-            "get_current_user": lambda: None,
-            "get_db": lambda: None,
-            "ChatLog": lambda **fields: SimpleNamespace(**fields),
-            "text": lambda value: value,
-            "checkpoint_lock_id": lambda user_id, session_id: 7,
-        }
-        endpoint = load_function(ROOT / "api/server.py", "chat_api", namespace)
-        app_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent=object())))
-        request = SimpleNamespace(message="问题", user_id="user-1", session_id="session-3")
-
-        first_db = FakeDB()
-        first_response = await endpoint(request, app_request, {"user_id": "user-1"}, first_db)
-        self.assertIsInstance(first_response, StreamingResponse)
-        first_body = await self.response_text(first_response)
-        self.assertIn("event: token", first_body)
-        self.assertIn("event: error", first_body)
-        self.assertEqual(first_db.added, [])
-        self.assertEqual(first_db.commits, 0)
-        self.assertEqual(first_db.rollbacks, 1)
-        self.assertEqual(chatlog_rows, [])
-
-        retry_db = FakeDB()
-        retry_response = await endpoint(request, app_request, {"user_id": "user-1"}, retry_db)
-        retry_body = await self.response_text(retry_response)
-        self.assertIn("event: done", retry_body)
-        self.assertEqual(len(retry_db.added), 1)
-        self.assertEqual(retry_db.added[0].answer, "重试成功")
-        self.assertEqual(retry_db.commits, 1)
-        self.assertEqual(len(chatlog_rows), 1)
+        try:
+            turn = await begin_turn(self.db, self.owner, self.session.id, uuid.uuid4(), "问题")
+            with self.assertLogs("api.chat_stream", level="ERROR"):
+                body = await self.response_text(persisted_chat_response(turn, object(), model, lambda _: {"available": False}))
+            self.assertIn("event: token", body)
+            self.assertIn("event: error", body)
+            self.assertNotIn("event: done", body)
+            self.assertEqual((await self.db.scalars(select(ChatLog))).all(), [])
+            await self.db.refresh(turn.assistant)
+            self.assertEqual(turn.assistant.status, "failed")
+            retry = await begin_turn(self.db, self.owner, self.session.id, uuid.uuid4(), "问题")
+            body = await self.response_text(persisted_chat_response(retry, object(), model, lambda _: {"available": False}))
+            self.assertIn("event: done", body)
+            logs = (await self.db.scalars(select(ChatLog))).all()
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].answer, "重试成功")
+        finally:
+            await ChatStorageTests.asyncTearDown(self)
 
 
 if __name__ == "__main__":
