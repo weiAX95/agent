@@ -99,16 +99,16 @@ async def verify(url, schema):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             headers = {"x-test-user": str(owner)}
             request = {"session_id": str(sid), "request_id": str(uuid.uuid4()), "message": "第一轮问题"}
-            response = await client.post("/chat", headers=headers, json=request)
+            response = await client.post("/api/chat", headers=headers, json=request)
             assert response.status_code == 200 and "event: done" in response.text
-            replay = await client.post("/chat", headers=headers, json=request)
+            replay = await client.post("/api/chat", headers=headers, json=request)
             assert '"replayed": true' in replay.text and len(calls) == 1
-            conflict = await client.post("/chat", headers=headers, json={**request, "message": "改了正文"})
+            conflict = await client.post("/api/chat", headers=headers, json={**request, "message": "改了正文"})
             assert conflict.status_code == 409
-            forbidden = await client.post("/chat", headers={"x-test-user": str(other)}, json=request)
+            forbidden = await client.post("/api/chat", headers={"x-test-user": str(other)}, json=request)
             assert forbidden.status_code == 404
             second_request = {**request, "request_id": str(uuid.uuid4()), "message": "第二轮问题"}
-            response = await client.post("/chat", headers=headers, json=second_request)
+            response = await client.post("/api/chat", headers=headers, json=second_request)
             assert response.status_code == 200 and "event: done" in response.text
             assert len(calls[-1]["messages"]) == 4
         async with factory() as db:
@@ -144,9 +144,9 @@ async def verify(url, schema):
                 created = await client.post("/api/sessions", headers=headers, json={"title": "真实路由"})
                 assert created.status_code == 201
                 actual_request = {"session_id": created.json()["data"]["id"], "request_id": str(uuid.uuid4()), "message": "实际接口"}
-                forbidden = await client.post("/chat", headers={"Authorization": "Bearer " + other_token}, json=actual_request)
+                forbidden = await client.post("/api/chat", headers={"Authorization": "Bearer " + other_token}, json=actual_request)
                 assert forbidden.status_code == 404
-                response = await client.post("/chat", headers=headers, json=actual_request)
+                response = await client.post("/api/chat", headers=headers, json=actual_request)
                 assert response.status_code == 200 and "event: done" in response.text
                 frame = next(frame for frame in response.text.split("\n\n") if frame.startswith("event: done"))
                 done = json.loads(frame.split("data: ", 1)[1])

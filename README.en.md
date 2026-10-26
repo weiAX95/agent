@@ -60,7 +60,7 @@ First startup initializes the API tables and LangGraph checkpoint tables. A Post
 curl http://127.0.0.1:8000/health
 ```
 
-Register or log in first, then send the returned access token to `/chat`:
+Register or log in first, then send the returned access token to `/api/chat`:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/auth/register \
@@ -77,23 +77,23 @@ curl -X POST http://127.0.0.1:8000/api/sessions \
 SESSION_ID='paste_session_uuid_here'
 # Reuse request_id only when retransmitting exactly the same request.
 REQUEST_ID=$(python -c 'import uuid; print(uuid.uuid4())')
-curl -N -X POST http://127.0.0.1:8000/chat \
+curl -N -X POST http://127.0.0.1:8000/api/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
   -d "{\"session_id\":\"${SESSION_ID}\",\"request_id\":\"${REQUEST_ID}\",\"message\":\"Hello\"}"
 ```
 
-**API contract change (2026-10-26):** create a session before calling `/chat`, and supply `request_id`. The existing React frontend has not yet been adapted. This delivery covers backend persistence, not the history UI; see the [change map and verification](docs/session_storage_delivery.md).
+**API contract change (2026-10-26):** create a session before calling `/api/chat`, and supply `request_id`. The existing React frontend has not yet been adapted. This delivery covers backend persistence, not the history UI; see the [change map and verification](docs/session_storage_delivery.md).
 
 ## Engineering details
 
-- `/chat` streams SSE events such as `token`, `usage`, `done`, `stopped`, and `error`. A `done` event contains the complete answer in `data.answer`.
+- `/api/chat` streams SSE events such as `token`, `usage`, `done`, `stopped`, and `error`. A `done` event contains the complete answer in `data.answer`.
 - Token usage comes from the model provider through LangChain. Missing usage is marked unavailable rather than estimated from character counts.
 - The client sends POST JSON with `fetch` and reads the response stream; native browser `EventSource` cannot send this POST body.
 - [main.py](src/agent/main.py) uses `make_thread_id(user_id, session_id)` to produce stable, unambiguous checkpoint identities. Reusing a session ID across different users does not accidentally share short-term history.
 - Startup creates the PostgreSQL pool and agent; shutdown releases the pool. Each turn submits only the current user message. Recalled content is injected into a dynamic system prompt rather than accumulated in persisted message history. Agent replies and tool messages are persisted by checkpoints. `ChatLog` records question/answer pairs and does not restore checkpoint state.
-- `/chat` validates session ownership and acquires a session-level advisory lock from a dedicated pool for the full response lifetime. Overlapping requests for the same session return 409. User/assistant placeholders are committed before generation; terminal status and compatible `ChatLog` are committed before `done`/`stopped`. The request ID prevents duplicate generation on retransmission.
+- `/api/chat` validates session ownership and acquires a session-level advisory lock from a dedicated pool for the full response lifetime. Overlapping requests for the same session return 409. User/assistant placeholders are committed before generation; terminal status and compatible `ChatLog` are committed before `done`/`stopped`. The request ID prevents duplicate generation on retransmission.
 - The [request-scoped chat graph](src/agent/chat_workflow.py) coordinates recall, answering, and memory updates for both synchronous and POST SSE calls. The inner agent retains PostgreSQL checkpoints. Post-answer memory failures are logged while the completed answer is returned; see the [migration record](docs/chat_graph_migration.md).
 - `done` and `stopped` events include `chat_log_id`. The separate React frontend in `/Users/zhangweiwei/Desktop/code/web/my-app` can submit answer or memory feedback to `POST /api/feedback`; see the [review and regression workflow](docs/feedback_regression.md). That frontend is outside this Git repository.
 
@@ -124,14 +124,14 @@ python -m unittest discover -s tests -p 'test_chat_api.py'
 
 [GitHub Actions](.github/workflows/offline-regression.yml) runs these ten offline suites on pushes and pull requests, without connecting to real models, PostgreSQL, or Milvus.
 
-**Existing repository verification record — not a full acceptance test of current authentication and feedback:** checkpoint initialization was exercised in a temporary schema on real PostgreSQL. A fake chat model completed two turns; after closing and recreating the pool, four human/AI messages were recovered. The temporary schema was removed. FastAPI lifespan startup and `/health` returned HTTP 200 with a connected database. Two real database sessions confirmed that a second request for the same advisory lock waits for the first transaction to commit. Full `/chat`, real-model/Milvus integration, cross-user isolation, and concurrent load still require integration testing.
+**Existing repository verification record — not a full acceptance test of current authentication and feedback:** checkpoint initialization was exercised in a temporary schema on real PostgreSQL. A fake chat model completed two turns; after closing and recreating the pool, four human/AI messages were recovered. The temporary schema was removed. FastAPI lifespan startup and `/health` returned HTTP 200 with a connected database. Two real database sessions confirmed that a second request for the same advisory lock waits for the first transaction to commit. Full `/api/chat`, real-model/Milvus integration, cross-user isolation, and concurrent load still require integration testing.
 
 ## Known limitations
 
-- `/chat` derives identity from the JWT `sub` claim, and path, topic, and task APIs check ownership. These changes have not passed two-user end-to-end acceptance. The standalone graph example still needs trusted identity binding for memory tools; composite thread IDs alone do not establish project-wide access control.
+- `/api/chat` derives identity from the JWT `sub` claim, and path, topic, and task APIs check ownership. These changes have not passed two-user end-to-end acceptance. The standalone graph example still needs trusted identity binding for memory tools; composite thread IDs alone do not establish project-wide access control.
 - Old `InMemorySaver` history is not migrated; new deployments start with new checkpoints.
 - Lock wait timeouts, high-concurrency latency, and multi-process behavior need load testing. Checkpoint writes and `ChatLog` commits use separate connections and transactions: checkpoint state may advance even when log persistence fails. Compensation or retry behavior remains to be defined.
-- [graph.py](src/agent/graph.py) is a separate learning entry point and is not unified with the API persistence flow. Its examples are not acceptance evidence for `/chat`.
+- [graph.py](src/agent/graph.py) is a separate learning entry point and is not unified with the API persistence flow. Its examples are not acceptance evidence for `/api/chat`.
 
 ## Further reading
 

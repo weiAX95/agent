@@ -10,7 +10,7 @@
 
 1. ORM 对齐已创建的 chat_sessions、chat_messages。
 2. POST /api/sessions 创建空会话，归属从 JWT 取得。
-3. /chat 接入消息占位、序号、请求幂等、最终正文/状态以及旧 ChatLog 反馈兼容。
+3. /api/chat 接入消息占位、序号、请求幂等、最终正文/状态以及旧 ChatLog 反馈兼容。
 4. 保持同会话互斥，验证跨提交的锁安全、断线和异常清理。
 5. 补充回归与隔离 PostgreSQL 集成验证，归档修改清单与结果。
 

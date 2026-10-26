@@ -86,5 +86,9 @@ def make_app(factory, pool, model):
     app.state.agent = object()
     app.state.chat_lock_pool = pool
     app.post("/api/sessions", status_code=201)(ns["create_chat_session"])
-    app.post("/chat")(ns["chat_api"])
+    # Use the production decorator path so a missing route migration fails tests.
+    server_tree = ast.parse((ROOT / "api/server.py").read_text())
+    handler = next(node for node in server_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "chat_api")
+    route_path = handler.decorator_list[0].args[0].value
+    app.post(route_path)(ns["chat_api"])
     return app

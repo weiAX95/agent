@@ -72,7 +72,7 @@ Content-Type: application/json
 然后发送：
 
 ```http
-POST /chat
+POST /api/chat
 Authorization: Bearer <access_token>
 Content-Type: application/json
 Accept: text/event-stream

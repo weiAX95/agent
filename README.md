@@ -64,7 +64,7 @@ python -m uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 curl http://127.0.0.1:8000/health
 ```
 
-`/chat` 需要先注册或登录，再用返回的 access token 请求：
+`/api/chat` 需要先注册或登录，再用返回的 access token 请求：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/auth/register \
@@ -81,7 +81,7 @@ curl -X POST http://127.0.0.1:8000/api/sessions \
 SESSION_ID='paste_session_uuid_here'
 # 每条新消息使用新 request_id；同一请求网络重发时复用它。
 REQUEST_ID=$(python -c 'import uuid; print(uuid.uuid4())')
-curl -N -X POST http://127.0.0.1:8000/chat \
+curl -N -X POST http://127.0.0.1:8000/api/chat \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
@@ -90,13 +90,13 @@ curl -N -X POST http://127.0.0.1:8000/chat \
 
 ## 工程细节
 
-`/chat` 使用 SSE 返回 `token`、`usage`、`done`、`stopped` 或 `error` 事件。`usage` 是模型供应商经 LangChain 返回的真实 token 统计；供应商未返回时标记不可用，不按字符数伪造估算。前端以 `fetch` 发送 POST JSON 并读取响应流；浏览器原生 `EventSource` 不支持这里使用的 POST 请求体。收到 `done` 时，`data.answer` 是完整回复。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担 checkpoint 恢复状态的工作。
+`/api/chat` 使用 SSE 返回 `token`、`usage`、`done`、`stopped` 或 `error` 事件。`usage` 是模型供应商经 LangChain 返回的真实 token 统计；供应商未返回时标记不可用，不按字符数伪造估算。前端以 `fetch` 发送 POST JSON 并读取响应流；浏览器原生 `EventSource` 不支持这里使用的 POST 请求体。收到 `done` 时，`data.answer` 是完整回复。[main.py](src/agent/main.py) 用 `make_thread_id(user_id, session_id)` 生成稳定且无歧义的 checkpoint 线程 ID；同一用户、同一会话会继续之前的短期历史，不同用户复用相同 `session_id` 也不会意外共用线程。API 启动时创建 PostgreSQL 连接池和 Agent，关闭时释放连接。每轮只提交当前用户消息；召回内容通过动态系统提示传入，不累积到持久化消息历史中。Agent 回复和工具消息仍由 checkpoint 保存。`ChatLog` 只记录问答，不承担 checkpoint 恢复状态的工作。
 
-`/chat` 先验证会话归属，再通过独立连接池持有 session advisory lock，覆盖消息占位提交、模型执行和最终结果写入。同一会话并发请求返回 409，不排队盲跑；不同会话使用不同锁键。每轮先提交用户消息和生成中的助手消息，结束后更新状态并兼容写入 `ChatLog`，提交成功后才发终态。请求幂等依靠 `request_id`：相同正文重放终态，同键不同正文返回 409。详情与修改地图见 [新会话存储交付](docs/session_storage_delivery.md)。
+`/api/chat` 先验证会话归属，再通过独立连接池持有 session advisory lock，覆盖消息占位提交、模型执行和最终结果写入。同一会话并发请求返回 409，不排队盲跑；不同会话使用不同锁键。每轮先提交用户消息和生成中的助手消息，结束后更新状态并兼容写入 `ChatLog`，提交成功后才发终态。请求幂等依靠 `request_id`：相同正文重放终态，同键不同正文返回 409。详情与修改地图见 [新会话存储交付](docs/session_storage_delivery.md)。
 
 正式聊天流程由 [请求级业务图](src/agent/chat_workflow.py) 编排召回、回答和长期记忆维护；图本身不另存 checkpoint。同步调用与 POST SSE 接口共享这些阶段，流式 token、断线停止和失败清理仍由原有 Agent 流处理。回答后的记忆维护失败会记录服务端异常并保留回答；节点与验证范围见 [迁移记录](docs/chat_graph_migration.md)。
 
-**调用合约变化（2026-10-26）**：`/chat` 现在要求先创建会话并提供 `request_id`。现有 React 前端尚未适配，直接发送旧请求会被拒绝；本轮仅交付后端与接口验证。
+**调用合约变化（2026-10-26）**：`/api/chat` 现在要求先创建会话并提供 `request_id`。现有 React 前端尚未适配，直接发送旧请求会被拒绝；本轮仅交付后端与接口验证。
 
 独立的 React 前端位于 `/Users/zhangweiwei/Desktop/code/web/my-app`。新版本的 `done` / `stopped` 事件附带 `chat_log_id`；页面可将回答问题或记忆问题提交到 `POST /api/feedback`，由服务端按当前用户验证记录归属。人工脱敏、回归样本提升及基线对比命令见 [反馈回归流程](docs/feedback_regression.md)。
 
@@ -127,14 +127,14 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上十组离
 
 以下为仓库原有的验证记录，不能代替当前认证和反馈流程的完整端到端验收。
 
-此前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。此前 FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
+此前已在真实 PostgreSQL 的临时 schema 中执行 checkpoint 初始化，以假聊天模型完成两轮调用，并在关闭、重建连接池后恢复出 4 条 human/AI 消息；临时 schema 已清理。此前 FastAPI 的实际生命周期启动和 `/health` 检查也已通过（HTTP 200、数据库已连接）。另用两个真实数据库会话确认同一 advisory lock 的第二个请求会等待第一个事务提交。完整 `/api/chat`、真实模型与 Milvus 的端到端流程、跨用户隔离及并发负载仍需联调。
 
 ## 当前边界
 
-- `/chat` 从 JWT `sub` 获取 `user_id`，路径、主题和任务接口加入了所有权检查；双用户端到端验收仍未完成。独立 Graph 示例的记忆工具仍需可信身份绑定；不能仅凭复合线程 ID 断言整个项目已完成访问控制。
+- `/api/chat` 从 JWT `sub` 获取 `user_id`，路径、主题和任务接口加入了所有权检查；双用户端到端验收仍未完成。独立 Graph 示例的记忆工具仍需可信身份绑定；不能仅凭复合线程 ID 断言整个项目已完成访问控制。
 - 旧版 `InMemorySaver` 中的历史不会自动迁移到 PostgreSQL；新部署从新的 checkpoint 开始。
-- 当前 `/chat` 用独立连接池的 PostgreSQL session advisory lock 互斥同一会话；高并发延迟、多进程与进程退出边界仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
-- `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/chat` 的验收结果。
+- 当前 `/api/chat` 用独立连接池的 PostgreSQL session advisory lock 互斥同一会话；高并发延迟、多进程与进程退出边界仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
+- `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/api/chat` 的验收结果。
 
 ## 项目文档
 

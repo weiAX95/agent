@@ -32,6 +32,7 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
 
         app = make_app(self.factory, pool, model)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            self.assertEqual((await client.post("/chat", json={})).status_code, 404)
             self.assertEqual((await client.post("/api/sessions", json={})).status_code, 401)
             headers = {"x-test-user": str(self.owner)}
             self.assertEqual((await client.post("/api/sessions", headers=headers, json={"owner_id": str(self.other)})).status_code, 422)
@@ -39,20 +40,20 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(created.status_code, 201)
             sid = created.json()["data"]["id"]
             request = {"session_id": sid, "request_id": str(uuid.uuid4()), "message": "你好"}
-            forbidden = await client.post("/chat", headers={"x-test-user": str(self.other)}, json=request)
+            forbidden = await client.post("/api/chat", headers={"x-test-user": str(self.other)}, json=request)
             self.assertEqual(forbidden.status_code, 404)
             self.assertEqual(calls, [])
             invalid = dict(request); invalid.pop("request_id")
-            self.assertEqual((await client.post("/chat", headers=headers, json=invalid)).status_code, 422)
-            result = await client.post("/chat", headers=headers, json=request)
+            self.assertEqual((await client.post("/api/chat", headers=headers, json=invalid)).status_code, 422)
+            result = await client.post("/api/chat", headers=headers, json=request)
             self.assertEqual(result.status_code, 200)
             self.assertIn("event: done", result.text)
             self.assertEqual(pool.keys, set())
-            replay = await client.post("/chat", headers=headers, json=request)
+            replay = await client.post("/api/chat", headers=headers, json=request)
             self.assertIn('"replayed": true', replay.text)
             self.assertEqual(len(calls), 1)
             request["message"] = "不同正文"
-            self.assertEqual((await client.post("/chat", headers=headers, json=request)).status_code, 409)
+            self.assertEqual((await client.post("/api/chat", headers=headers, json=request)).status_code, 409)
             self.assertEqual(pool.keys, set())
             self.assertEqual(pool.borrowed, 0)
 
@@ -73,10 +74,10 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             headers = {"x-test-user": str(self.owner)}
             request = {"session_id": str(self.session.id), "request_id": str(uuid.uuid4()), "message": "问题"}
-            active = asyncio.create_task(client.post("/chat", headers=headers, json=request))
+            active = asyncio.create_task(client.post("/api/chat", headers=headers, json=request))
             try:
                 await asyncio.wait_for(started.wait(), 2)
-                duplicate = await client.post("/chat", headers=headers, json=request)
+                duplicate = await client.post("/api/chat", headers=headers, json=request)
                 self.assertEqual(duplicate.status_code, 409)
                 self.assertEqual(calls, 1)
             finally:
@@ -85,7 +86,7 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("event: done", result.text)
             self.assertEqual(pool.keys, set())
             request["request_id"] = str(uuid.uuid4())
-            self.assertEqual((await client.post("/chat", headers=headers, json=request)).status_code, 200)
+            self.assertEqual((await client.post("/api/chat", headers=headers, json=request)).status_code, 200)
             self.assertEqual(calls, 2)
             self.assertEqual(pool.keys, set())
             self.assertEqual(pool.borrowed, 0)
@@ -105,7 +106,7 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
         app = make_app(self.factory, pool, model)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             active = asyncio.create_task(client.post(
-                "/chat", headers={"x-test-user": str(self.owner)},
+                "/api/chat", headers={"x-test-user": str(self.owner)},
                 json={"session_id": str(self.session.id), "request_id": str(uuid.uuid4()), "message": "问题"},
             ))
             await asyncio.wait_for(started.wait(), 2)

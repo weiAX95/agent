@@ -27,7 +27,8 @@ from src.agent.main import build_agent, chat_stream
 
 from api.auth import get_current_user
 from api.config import settings
-from api.db import Base, check_db_connection, engine, get_db
+from api.base import Base
+from api.db import check_db_connection, engine, get_db
 from api.chat_storage import begin_turn, owned_session, session_execution_lock
 from api.chat_stream import ChatRequest, persisted_chat_response
 from api.routers import auth, feedback, paths, sessions, tasks, topics
@@ -139,7 +140,7 @@ async def get_chat_turn(
                     logger.exception("Could not finalize interrupted request_id=%s", request.request_id)
 
 
-@app.post("/chat")
+@app.post("/api/chat")
 async def chat_api(
     request: ChatRequest,
     http_request: Request,
