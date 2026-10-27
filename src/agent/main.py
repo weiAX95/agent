@@ -644,7 +644,7 @@ async def _restore_stopped_turn(
 
 async def chat_stream(
     message: str, session_id: str, user_id: str, agent, on_token, callbacks=None
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     result = await chat_workflow.ainvoke(
         {
             "message": message,
@@ -655,7 +655,12 @@ async def chat_stream(
             "callbacks": callbacks,
         }
     )
-    return result["status"], result["answer"]
+    memory_status = (
+        "skipped" if result["status"] == "stopped" else
+        "failed" if result.get("memory_error") else
+        result.get("memory_status", "unknown")
+    )
+    return result["status"], result["answer"], memory_status
 
 
 async def _discard_incomplete_turn(agent, config, message_id: str) -> None:

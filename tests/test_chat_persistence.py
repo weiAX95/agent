@@ -85,6 +85,29 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("原回复", body)
         self.assertNotIn("event: usage", body)
 
+    async def test_memory_failure_is_persisted_and_replayed_without_rerunning_model(self):
+        request_id = uuid.uuid4()
+        turn = await self.begin(request_id, message="我叫张三")
+
+        async def model(**_kwargs):
+            return "done", "你好，张三", "failed"
+
+        first = await self.body(self.response(turn, model))
+        self.assertIn('"memory_status": "failed"', first)
+        self.assertIn("event: done", first)
+        async with self.factory() as reader:
+            saved = await reader.get(ChatMessage, turn.assistant_id)
+            self.assertEqual(saved.memory_status, "failed")
+
+        replay = await self.begin(request_id, message="我叫张三")
+
+        async def forbidden(**_kwargs):
+            raise AssertionError("duplicate model invocation")
+
+        second = await self.body(self.response(replay, forbidden))
+        self.assertIn('"memory_status": "failed"', second)
+        self.assertIn('"replayed": true', second)
+
     async def test_stopped_reply_keeps_partial_and_emits_stopped(self):
         turn = await self.begin()
 

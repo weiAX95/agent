@@ -41,7 +41,8 @@ def terminal_event(turn: ChatTurn):
     if message.status in {"completed", "stopped"}:
         name = "done" if message.status == "completed" else "stopped"
         answer = message.content + ("\n\n[本轮已停止生成]" if name == "stopped" else "")
-        return name, {**ids, "answer": answer, "chat_log_id": str(turn.log_id)}
+        return name, {**ids, "answer": answer, "chat_log_id": str(turn.log_id),
+                      "memory_status": message.memory_status or "unknown"}
     return "error", {**ids, "code": message.error_code,
                      "message": "上次请求未完成，请使用新请求重试；异常中断的会话需要先核对上下文"}
 
@@ -72,11 +73,13 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
         async def produce():
             try:
                 try:
-                    status, answer = await chat_stream(
+                    result = await chat_stream(
                         message=turn.user_content, user_id=str(turn.owner_id),
                         session_id=str(turn.session_id), agent=agent,
                         on_token=on_token, callbacks=[usage],
                     )
+                    status, answer = result[:2]
+                    memory_status = result[2] if len(result) > 2 else "unknown"
                 except asyncio.CancelledError:
                     # A model that propagates cancellation has not confirmed checkpoint cleanup.
                     with anyio.CancelScope(shield=True):
@@ -97,7 +100,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                     raise ValueError("Unexpected chat terminal status")
                 # Cancellation converted to 'stopped' by the agent must still be persisted.
                 with anyio.CancelScope(shield=True):
-                    await turn.finish("completed" if status == "done" else "stopped", answer or "")
+                    await turn.finish("completed" if status == "done" else "stopped", answer or "",
+                                      memory_status=memory_status)
                 await queue.put(("usage", usage_payload(usage)))
                 await queue.put(terminal_event(turn))
             except Exception:

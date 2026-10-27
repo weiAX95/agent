@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.chat_storage import begin_turn, create_session, owned_session, session_execution_lock
 from api.chat_stream import ChatRequest, persisted_chat_response
+from api.models import ChatSession
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -80,8 +81,9 @@ def make_app(factory, pool, model):
         "logger": logging.getLogger("chat-api-fixture"),
     }
     load_definitions(ROOT / "api/server.py", {"get_chat_turn", "chat_api"}, ns)
-    ns.update(BaseModel=BaseModel, ConfigDict=ConfigDict, Field=Field, create_session=create_session)
-    load_definitions(ROOT / "api/routers/sessions.py", {"SessionCreate", "create_chat_session"}, ns)
+    ns.update(BaseModel=BaseModel, ConfigDict=ConfigDict, Field=Field,
+              ChatSession=ChatSession, create_session=create_session)
+    load_definitions(ROOT / "api/routers/sessions.py", {"SessionCreate", "owner_id", "session_data", "create_chat_session"}, ns)
     app = FastAPI()
     app.state.agent = object()
     app.state.chat_lock_pool = pool

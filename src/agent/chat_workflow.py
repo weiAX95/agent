@@ -31,6 +31,7 @@ class ChatState(TypedDict, total=False):
     candidate_by_key: dict[str, str]
     resolution_by_key: dict
     memory_error: str
+    memory_status: str
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,7 @@ def build_chat_workflow(services: ChatServices):
     def judge(state: ChatState) -> dict:
         if not services.should_extract_memory(state["message"]):
             print("[Memory Extract] skipped: empty message")
-            return {"candidate_by_key": {}}
+            return {"candidate_by_key": {}, "memory_status": "skipped"}
         candidate = services.judge_memory(
             state["message"], callbacks=state.get("callbacks")
         )
@@ -135,7 +136,7 @@ def build_chat_workflow(services: ChatServices):
                 raise ValueError(f"{item.memory_key} 的候选记忆不能为空")
             by_key[item.memory_key] = item.memory.strip()
         print("[Memory Extract] candidate_keys=", list(by_key))
-        return {"candidate_by_key": by_key}
+        return {"candidate_by_key": by_key, "memory_status": "pending" if by_key else "skipped"}
 
     def resolve(state: ChatState) -> dict:
         by_key = state["candidate_by_key"]
@@ -167,6 +168,7 @@ def build_chat_workflow(services: ChatServices):
         return {"resolution_by_key": decisions}
 
     def persist(state: ChatState) -> dict:
+        changed = False
         for key, memory in state["candidate_by_key"].items():
             decision = state["resolution_by_key"].get(key)
             if decision is None or decision.action == "insert":
@@ -177,6 +179,7 @@ def build_chat_workflow(services: ChatServices):
                         "memory_key": key,
                     }
                 )
+                changed = True
                 print("[Memory Persist] insert succeeded: key=", key)
             elif decision.action == "replace":
                 services.replace_memory(
@@ -185,10 +188,11 @@ def build_chat_workflow(services: ChatServices):
                     memory_key=key,
                     memory_id=decision.memory_id,
                 )
+                changed = True
                 print("[Memory Persist] replace succeeded: key=", key)
             else:
                 print("[Memory Persist] unchanged: key=", key)
-        return {}
+        return {"memory_status": "saved" if changed else "unchanged"}
 
     def safe(name: str, operation: Callable):
         def run(state: ChatState) -> dict:

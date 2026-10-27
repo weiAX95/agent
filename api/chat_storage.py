@@ -9,15 +9,17 @@ import anyio
 from fastapi import HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
 from api.models import ChatLog, ChatMessage, ChatSession
-from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
 
 async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> ChatSession:
     session_id = uuid.uuid4()
     session = ChatSession(
-        id=session_id, owner_id=owner, title=title.strip() or "新会话",
+        id=session_id,
+        owner_id=owner,
+        title=title.strip() or "新会话",
         checkpoint_thread_id=make_thread_id(str(owner), str(session_id)),
     )
     db.add(session)
@@ -27,10 +29,15 @@ async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> Chat
 
 
 async def owned_session(db: AsyncSession, owner: uuid.UUID, session_id: uuid.UUID):
-    session = await db.scalar(select(ChatSession).where(
-        ChatSession.id == session_id, ChatSession.owner_id == owner,
-        ChatSession.deleted_at.is_(None),
-    ).execution_options(populate_existing=True))
+    session = await db.scalar(
+        select(ChatSession)
+        .where(
+            ChatSession.id == session_id,
+            ChatSession.owner_id == owner,
+            ChatSession.deleted_at.is_(None),
+        )
+        .execution_options(populate_existing=True)
+    )
     if session is None:
         raise HTTPException(404, "会话不存在或不可访问，请先创建会话")
     return session
@@ -87,34 +94,70 @@ class ChatTurn:
 
     @property
     def log_id(self):
-        return self.assistant_id if self.assistant.status in ("completed", "stopped") else None
+        return (
+            self.assistant_id
+            if self.assistant.status in ("completed", "stopped")
+            else None
+        )
 
     async def save_partial(self, content: str):
-        await self.db.execute(update(ChatMessage).where(
-            ChatMessage.id == self.assistant_id, ChatMessage.status == "streaming",
-        ).values(content=content, updated_at=datetime.now(UTC)))
+        await self.db.execute(
+            update(ChatMessage)
+            .where(
+                ChatMessage.id == self.assistant_id,
+                ChatMessage.status == "streaming",
+            )
+            .values(content=content, updated_at=datetime.now(UTC))
+        )
         await self.db.commit()
 
-    async def finish(self, status: str, content: str, error_code: str | None = None):
+    async def finish(self, status: str, content: str, error_code: str | None = None,
+                     memory_status: str | None = None):
         if status not in {"completed", "stopped", "failed", "interrupted"}:
             raise ValueError("Invalid terminal message status")
+        if memory_status not in {None, "saved", "unchanged", "skipped", "failed", "unknown"}:
+            raise ValueError("Invalid memory status")
         now = datetime.now(UTC)
         try:
-            result = await self.db.execute(update(ChatMessage).where(
-                ChatMessage.id == self.assistant_id, ChatMessage.status == "streaming",
-            ).values(content=content, status=status, error_code=error_code,
-                     updated_at=now, finished_at=now))
+            result = await self.db.execute(
+                update(ChatMessage)
+                .where(
+                    ChatMessage.id == self.assistant_id,
+                    ChatMessage.status == "streaming",
+                )
+                .values(
+                    content=content,
+                    status=status,
+                    error_code=error_code,
+                    memory_status=memory_status,
+                    updated_at=now,
+                    finished_at=now,
+                )
+            )
             if result.rowcount:
-                await self.db.execute(update(ChatSession).where(
-                    ChatSession.id == self.session_id,
-                ).values(last_message_at=now, updated_at=now))
+                await self.db.execute(
+                    update(ChatSession)
+                    .where(
+                        ChatSession.id == self.session_id,
+                    )
+                    .values(last_message_at=now, updated_at=now)
+                )
                 if status in {"completed", "stopped"}:
-                    answer = content + ("\n\n[本轮已停止生成]" if status == "stopped" else "")
-                    self.db.add(ChatLog(
-                        id=self.assistant_id, user_id=str(self.owner_id),
-                        session_id=str(self.session_id), message=self.user_content, answer=answer,
-                    ))
+                    answer = content + (
+                        "\n\n[本轮已停止生成]" if status == "stopped" else ""
+                    )
+                    self.db.add(
+                        ChatLog(
+                            id=self.assistant_id,
+                            user_id=str(self.owner_id),
+                            session_id=str(self.session_id),
+                            message=self.user_content,
+                            answer=answer,
+                        )
+                    )
             await self.db.commit()
+            if result.rowcount:
+                self.assistant.memory_status = memory_status
         except BaseException:
             await self.db.rollback()
             raise
@@ -122,10 +165,19 @@ class ChatTurn:
 
     async def interrupt_if_streaming(self):
         await self.db.rollback()
-        await self.db.execute(update(ChatMessage).where(
-            ChatMessage.id == self.assistant_id, ChatMessage.status == "streaming",
-        ).values(status="interrupted", error_code="CHECKPOINT_RECOVERY_REQUIRED",
-                 updated_at=datetime.now(UTC), finished_at=datetime.now(UTC)))
+        await self.db.execute(
+            update(ChatMessage)
+            .where(
+                ChatMessage.id == self.assistant_id,
+                ChatMessage.status == "streaming",
+            )
+            .values(
+                status="interrupted",
+                error_code="CHECKPOINT_RECOVERY_REQUIRED",
+                updated_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+            )
+        )
         await self.db.commit()
 
 
@@ -134,9 +186,14 @@ async def begin_turn(db, owner, session_id, request_id, message):
     session = await owned_session(db, owner, session_id)
     if session.checkpoint_thread_id != make_thread_id(str(owner), str(session_id)):
         raise HTTPException(409, "此会话需要先完成旧线程映射迁移")
-    rows = (await db.scalars(select(ChatMessage).where(
-        ChatMessage.session_id == session_id, ChatMessage.request_id == request_id,
-    ))).all()
+    rows = (
+        await db.scalars(
+            select(ChatMessage).where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.request_id == request_id,
+            )
+        )
+    ).all()
     if rows:
         by_role = {row.role: row for row in rows}
         if set(by_role) != {"user", "assistant"}:
@@ -149,12 +206,19 @@ async def begin_turn(db, owner, session_id, request_id, message):
 
     # Holding the advisory lock proves no other conforming worker is executing.
     # An orphan might already have updated its checkpoint; never rerun blindly.
-    stale = await db.scalar(select(ChatMessage).where(
-        ChatMessage.session_id == session_id, ChatMessage.role == "assistant",
-        (ChatMessage.status == "streaming") |
-        ((ChatMessage.status == "interrupted") &
-         (ChatMessage.error_code == "CHECKPOINT_RECOVERY_REQUIRED")),
-    ).limit(1))
+    stale = await db.scalar(
+        select(ChatMessage)
+        .where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.role == "assistant",
+            (ChatMessage.status == "streaming")
+            | (
+                (ChatMessage.status == "interrupted")
+                & (ChatMessage.error_code == "CHECKPOINT_RECOVERY_REQUIRED")
+            ),
+        )
+        .limit(1)
+    )
     if stale is not None:
         if stale.status == "streaming":
             stale.status = "interrupted"
@@ -165,10 +229,25 @@ async def begin_turn(db, owner, session_id, request_id, message):
 
     now = datetime.now(UTC)
     seq = session.next_message_seq
-    user = ChatMessage(id=uuid.uuid4(), session_id=session_id, request_id=request_id,
-                       seq=seq, role="user", content=message, status="completed", finished_at=now)
-    assistant = ChatMessage(id=uuid.uuid4(), session_id=session_id, request_id=request_id,
-                            seq=seq + 1, role="assistant", content="", status="streaming")
+    user = ChatMessage(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        request_id=request_id,
+        seq=seq,
+        role="user",
+        content=message,
+        status="completed",
+        finished_at=now,
+    )
+    assistant = ChatMessage(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        request_id=request_id,
+        seq=seq + 1,
+        role="assistant",
+        content="",
+        status="streaming",
+    )
     session.next_message_seq += 2
     if session.last_message_at is None and session.title == "新会话":
         session.title = message.strip()[:200]

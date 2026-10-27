@@ -77,6 +77,7 @@ class ChatWorkflowTests(unittest.TestCase):
             {"message": "我喜欢茶", "session_id": "s1", "user_id": "alice", "agent": agent}
         )
         self.assertEqual(result["answer"], "回答")
+        self.assertEqual(result["memory_status"], "saved")
         self.assertEqual(events, ["recall", "persist"])
         self.assertEqual(agent.calls[0][1]["config"]["configurable"]["thread_id"], "alice:s1")
 
@@ -89,6 +90,7 @@ class ChatWorkflowTests(unittest.TestCase):
             )
         self.assertEqual(result["answer"], "回答")
         self.assertEqual(result["memory_error"], "persist")
+        self.assertEqual(result["memory_status"], "pending")
 
 
 class ChatStreamWorkflowTests(unittest.IsolatedAsyncioTestCase):

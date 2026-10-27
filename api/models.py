@@ -88,6 +88,7 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))
+    memory_status: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
