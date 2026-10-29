@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.auth import get_current_user
 from api.chat_storage import create_session, owned_session
 from api.db import get_db
-from api.models import ChatMessage, ChatSession
+from api.models import ChatMessage, ChatRunEvent, ChatSession
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -116,6 +116,19 @@ async def chat_session_messages(
     rows = (await db.scalars(query.order_by(ChatMessage.seq.desc()).limit(limit + 1))).all()
     has_more = len(rows) > limit
     page = list(reversed(rows[:limit]))
+    event_map = {row.id: [] for row in page if row.role == "assistant"}
+    if event_map:
+        events = (await db.scalars(
+            select(ChatRunEvent).where(ChatRunEvent.message_id.in_(event_map))
+            .order_by(ChatRunEvent.message_id, ChatRunEvent.sequence)
+        )).all()
+        for event in events:
+            event_map[event.message_id].append({
+                "id": str(event.id), "message_id": str(event.message_id),
+                "sequence": event.sequence, "stage": event.stage,
+                "status": event.status, "summary": event.summary,
+                "sources": event.sources, "created_at": event.created_at.isoformat(),
+            })
     return {
         "code": 0,
         "data": {
@@ -129,6 +142,7 @@ async def chat_session_messages(
                     "status": row.status,
                     "error_code": row.error_code,
                     "memory_status": row.memory_status or "unknown",
+                    "events": event_map.get(row.id, []),
                 }
                 for row in page
             ],

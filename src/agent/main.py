@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Literal, TypeAlias
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRequest, dynamic_prompt
+from langchain.agents.middleware import (
+    ModelRequest,
+    ToolCallLimitMiddleware,
+    dynamic_prompt,
+)
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langchain_core.output_parsers import PydanticOutputParser
@@ -17,6 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.agent.chat_workflow import ChatServices, build_chat_workflow
 from src.agent.checkpoint import make_thread_id
+from src.agent.research_agent import build_research_tool
+from src.agent.progress_tool import progress_tool
 from src.agent.tools import (
     _get_memories_by_keys,
     _recall_memories,
@@ -52,11 +58,24 @@ def conversation_prompt(request: ModelRequest) -> str:
 
 def build_agent(checkpointer):
     """Build the conversation agent with an application-owned checkpointer."""
+    # 子 Agent 的入口：这里得到的是名为 research 的工具包装，不是子 Agent 的内部状态。
+    # 网页/知识库工具只交给子 Agent；主 Agent 看见的工具是 research 和 report_progress。
+    research = build_research_tool(llm, tools)
+    # 主 Agent：接收用户问题，决定是否调用 research，并用 checkpointer 保存会话上下文。
+    # 调用 research 时，模型给出 query；工具返回 JSON，作为 ToolMessage 进入主 Agent 的消息流。
     return create_agent(
         model=llm,
-        tools=tools,
+        tools=[research, progress_tool],
         checkpointer=checkpointer,
-        middleware=[conversation_prompt],
+        middleware=[
+            conversation_prompt,
+            ToolCallLimitMiddleware(
+                tool_name="research", run_limit=2, exit_behavior="continue"
+            ),
+            ToolCallLimitMiddleware(
+                tool_name="report_progress", run_limit=6, exit_behavior="continue"
+            ),
+        ],
     )
 
 
@@ -572,6 +591,20 @@ def _prepare_chat(
             3. 如果当前用户明确表达的信息和长期记忆冲突，以当前消息为准。
             4. 不允许根据长期记忆推测用户没有明确表达的信息。
 
+            资料检索规则：
+            需要查证外部事实、网页资料或内部知识库时调用 research 工具。
+            普通对话和已召回的个人信息问答直接回答。引用检索结果时标明来源。
+            research 返回 status=limited 时，仅表示本轮检索未完成。不要向用户声称平台、
+            当前会话或用户配置存在工具次数限制。根据可靠证据回答；证据不足时明确说无法确认。
+
+            可见思路摘要：
+            处理复杂问题时，使用 report_progress 公开处理过程。先说明如何理解问题与约束；
+            需要检索时说明要查证什么；得到资料后说明可靠依据与尚不确定的点；
+            最后说明如何组织回答。通常 2 到 4 次，每次 1 到 2 句，并填写适用的 phase、
+            basis 和 next_step。只报告可供用户阅读的分析摘要、已取得的证据和下一步行动，
+            不输出内部逐步推理、未经核实的判断、隐私细节或工具原文。
+            简单问答可直接回答，不必调用。
+
             输出格式要求：
             1. 需要分点或分节时，使用标准 Markdown；标题符号后必须有空格，
                标题、段落和列表项各自换行。
@@ -580,6 +613,7 @@ def _prepare_chat(
             """
 
     agent_input = {"messages": [{"role": "user", "content": message}]}
+    # 此 thread_id 只用于主 Agent 的会话 checkpoint；子 Agent 每次接收独立的 query。
     agent_config = {"configurable": {"thread_id": make_thread_id(user_id, session_id)}}
     agent_context = {"system_prompt": system_prompt}
 
@@ -643,7 +677,13 @@ async def _restore_stopped_turn(
 
 
 async def chat_stream(
-    message: str, session_id: str, user_id: str, agent, on_token, callbacks=None
+    message: str,
+    session_id: str,
+    user_id: str,
+    agent,
+    on_token,
+    callbacks=None,
+    on_activity=None,
 ) -> tuple[str, str, str]:
     result = await chat_workflow.ainvoke(
         {
@@ -652,13 +692,18 @@ async def chat_stream(
             "user_id": user_id,
             "agent": agent,
             "on_token": on_token,
+            "on_activity": on_activity,
             "callbacks": callbacks,
         }
     )
     memory_status = (
-        "skipped" if result["status"] == "stopped" else
-        "failed" if result.get("memory_error") else
-        result.get("memory_status", "unknown")
+        "skipped"
+        if result["status"] == "stopped"
+        else (
+            "failed"
+            if result.get("memory_error")
+            else result.get("memory_status", "unknown")
+        )
     )
     return result["status"], result["answer"], memory_status
 

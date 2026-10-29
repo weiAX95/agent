@@ -8,7 +8,9 @@ import uuid
 from sqlalchemy import select
 
 from api.chat_stream import ChatRequest, persisted_chat_response
-from api.models import ChatLog, ChatMessage
+from api.models import ChatLog, ChatMessage, ChatRunEvent
+from api.routers.sessions import chat_session_messages
+from fastapi import HTTPException
 import test_chat_storage as storage_tests
 
 
@@ -48,6 +50,67 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(turn.assistant_id), body)
         self.assertEqual(calls[0]["user_id"], str(self.owner))
         self.assertEqual(calls[0]["session_id"], str(self.session.id))
+
+    async def test_research_progress_precedes_final_answer_and_is_not_replayed(self):
+        request_id = uuid.uuid4()
+        turn = await self.begin(request_id)
+
+        async def model(**kwargs):
+            await kwargs["on_activity"]("research", "started")
+            await kwargs["on_activity"]("research", "completed")
+            await kwargs["on_token"]("结论")
+            return "done", "结论", "skipped"
+
+        frames = []
+        async for frame in self.response(turn, model).body_iterator:
+            frames.append(frame)
+            if frame.startswith("event: agent_step"):
+                payload = json.loads(frame.split("data: ", 1)[1])
+                async with self.factory() as reader:
+                    self.assertIsNotNone(await reader.get(ChatRunEvent, uuid.UUID(payload["id"])))
+        body = "".join(frames)
+        self.assertLess(body.index('"status": "started"'), body.index('"status": "completed"'))
+        self.assertLess(body.index('"status": "completed"'), body.index('event: done'))
+        async with self.factory() as reader:
+            rows = (await reader.scalars(select(ChatRunEvent).where(
+                ChatRunEvent.message_id == turn.assistant_id
+            ).order_by(ChatRunEvent.sequence))).all()
+            self.assertEqual([(row.sequence, row.stage, row.status) for row in rows], [
+                (1, "research", "started"), (2, "research", "completed"),
+                (3, "answer", "completed"), (4, "memory", "skipped"),
+            ])
+            history = await chat_session_messages(
+                turn.session_id, current_user={"user_id": str(self.owner)}, db=reader,
+                before_seq=None, limit=100,
+            )
+            self.assertEqual(len(history["data"]["items"][1]["events"]), 4)
+            with self.assertRaises(HTTPException) as denied:
+                await chat_session_messages(
+                    turn.session_id, current_user={"user_id": str(self.other)}, db=reader,
+                    before_seq=None, limit=100,
+                )
+            self.assertEqual(denied.exception.status_code, 404)
+        replay = await self.begin(request_id)
+        replayed = await self.body(self.response(replay, model))
+        self.assertNotIn("event: agent_step", replayed)
+        self.assertIn('"replayed": true', replayed)
+        self.assertEqual(len((await self.db.scalars(select(ChatRunEvent))).all()), 4)
+
+    async def test_visible_thought_summary_is_saved_and_streamed_before_answer(self):
+        turn = await self.begin(message="请分析方案")
+
+        async def model(**kwargs):
+            await kwargs["on_activity"]("progress", "started", {"summary": "先比较两种方案的成本"})
+            await kwargs["on_token"]("建议")
+            return "done", "建议", "skipped"
+
+        body = await self.body(self.response(turn, model))
+        self.assertLess(body.index("先比较两种方案的成本"), body.index('event: token'))
+        rows = (await self.db.scalars(select(ChatRunEvent).where(
+            ChatRunEvent.message_id == turn.assistant_id
+        ).order_by(ChatRunEvent.sequence))).all()
+        self.assertEqual((rows[0].stage, rows[0].status, rows[0].summary),
+                         ("answer", "started", "先比较两种方案的成本"))
 
     async def test_provider_failure_saves_partial_without_success_log_then_new_request_can_retry(self):
         turn = await self.begin()

@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
-from api.models import ChatLog, ChatMessage, ChatSession
+from api.models import ChatLog, ChatMessage, ChatRunEvent, ChatSession
 
 
 async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> ChatSession:
@@ -84,6 +84,7 @@ class ChatTurn:
     session_id: uuid.UUID = field(init=False)
     owner_id: uuid.UUID = field(init=False)
     request_id: uuid.UUID = field(init=False)
+    event_sequence: int = 0
 
     def __post_init__(self):
         # Retain identifiers even when SQLAlchemy expires ORM objects after rollback.
@@ -99,6 +100,29 @@ class ChatTurn:
             if self.assistant.status in ("completed", "stopped")
             else None
         )
+
+    async def append_event(self, stage: str, status: str, summary: str, sources=None):
+        if self.replayed:
+            raise ValueError("Cannot append to a replayed turn")
+        self.event_sequence += 1
+        event = ChatRunEvent(
+            id=uuid.uuid4(), message_id=self.assistant_id,
+            sequence=self.event_sequence, stage=stage, status=status,
+            summary=summary[:240], sources=(sources or [])[:5],
+        )
+        try:
+            self.db.add(event)
+            await self.db.commit()
+            await self.db.refresh(event)
+        except BaseException:
+            await self.db.rollback()
+            raise
+        return {
+            "id": str(event.id), "message_id": str(self.assistant_id),
+            "sequence": event.sequence, "stage": event.stage,
+            "status": event.status, "summary": event.summary,
+            "sources": event.sources, "created_at": event.created_at.isoformat(),
+        }
 
     async def save_partial(self, content: str):
         await self.db.execute(

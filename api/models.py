@@ -3,9 +3,9 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey,
-    Index, Integer, String, Text, UniqueConstraint, text,
+    Index, Integer, JSON, String, Text, UniqueConstraint, text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -92,6 +92,25 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ChatRunEvent(Base):
+    __tablename__ = "chat_run_events"
+    __table_args__ = (
+        UniqueConstraint("message_id", "sequence", name="uq_chat_run_events_order"),
+        CheckConstraint("sequence >= 1", name="ck_chat_run_events_sequence"),
+        CheckConstraint("stage IN ('research','answer','memory')", name="ck_chat_run_events_stage"),
+        CheckConstraint("status IN ('started','completed','failed','stopped','skipped')", name="ck_chat_run_events_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    summary: Mapped[str] = mapped_column(String(240), nullable=False)
+    sources: Mapped[list] = mapped_column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ChatLog(Base):

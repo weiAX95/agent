@@ -67,7 +67,26 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                 await turn.save_partial(partial)
                 last_saved = time.monotonic()
 
+        async def on_activity(agent_name, status, details=None):
+            if agent_name == "progress" and status == "started" and isinstance(details, dict):
+                summary = details.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    event = await turn.append_event("answer", "started", summary.strip()[:240])
+                    await queue.put(("agent_step", event))
+                return
+            if agent_name != "research" or status not in {"started", "completed", "failed"}:
+                return
+            summaries = {"started": "开始查找资料", "completed": "资料检索已完成", "failed": "资料检索失败"}
+            if status == "failed" and isinstance(details, dict) and details.get("reason") == "limited":
+                summaries["failed"] = "检索未完成，正在整理已获得的信息"
+            sources = details.get("sources", []) if isinstance(details, dict) else []
+            event = await turn.append_event("research", status, summaries[status], sources)
+            await queue.put(("agent_step", event))
+
         async def record_failure(code, content, interrupted=False):
+            event = await turn.append_event("answer", "stopped" if interrupted else "failed",
+                                            "生成异常中断" if interrupted else "回答生成失败")
+            await queue.put(("agent_step", event))
             await turn.finish("interrupted" if interrupted else "failed", content, code)
 
         async def produce():
@@ -76,7 +95,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                     result = await chat_stream(
                         message=turn.user_content, user_id=str(turn.owner_id),
                         session_id=str(turn.session_id), agent=agent,
-                        on_token=on_token, callbacks=[usage],
+                        on_token=on_token, callbacks=[usage], on_activity=on_activity,
                     )
                     status, answer = result[:2]
                     memory_status = result[2] if len(result) > 2 else "unknown"
@@ -100,6 +119,18 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                     raise ValueError("Unexpected chat terminal status")
                 # Cancellation converted to 'stopped' by the agent must still be persisted.
                 with anyio.CancelScope(shield=True):
+                    answer_event = await turn.append_event(
+                        "answer", "completed" if status == "done" else "stopped",
+                        "回答已生成" if status == "done" else "回答已停止",
+                    )
+                    await queue.put(("agent_step", answer_event))
+                    memory_event = await turn.append_event(
+                        "memory", "failed" if memory_status == "failed" else
+                        "skipped" if memory_status in {"skipped", "unknown"} else "completed",
+                        {"saved": "记忆已保存", "unchanged": "记忆无变更", "failed": "记忆保存失败",
+                         "skipped": "本轮无需保存记忆", "unknown": "记忆状态未知"}.get(memory_status, "记忆状态未知"),
+                    )
+                    await queue.put(("agent_step", memory_event))
                     await turn.finish("completed" if status == "done" else "stopped", answer or "",
                                       memory_status=memory_status)
                 await queue.put(("usage", usage_payload(usage)))

@@ -1,6 +1,7 @@
 """Request-scoped chat graph; the inner agent owns conversation checkpoints."""
 
 import asyncio
+import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -21,6 +22,7 @@ class ChatState(TypedDict, total=False):
     agent: Any
     callbacks: list | None
     on_token: Callable
+    on_activity: Callable | None
     memory_cache: dict
     get_memories: Callable
     agent_input: dict
@@ -79,11 +81,15 @@ def build_chat_workflow(services: ChatServices):
         return {"answer": result["messages"][-1].content, "status": "done"}
 
     async def aanswer(state: ChatState) -> dict:
+        # 外层业务图调用主 Agent 并观察流式事件；这里本身不是第三个 Agent。
         message_id = str(uuid.uuid4())
         payload = dict(state["agent_input"])
         payload["messages"] = [HumanMessage(id=message_id, content=state["message"])]
         config = state["agent_config"]
         partial = ""
+        research_call_ids: set[str] = set()
+        progress_call_ids: set[str] = set()
+        progress_updates = 0
         try:
             async for part in state["agent"].astream(
                 payload,
@@ -109,6 +115,57 @@ def build_chat_workflow(services: ChatServices):
                         complete = services.content_to_text(messages[-1].content)
                         if complete:
                             partial = complete
+                        if state.get("on_activity"):
+                            for call in getattr(messages[-1], "tool_calls", []):
+                                call_id = call.get("id")
+                                if (call.get("name") == "report_progress" and isinstance(call_id, str)
+                                        and call_id not in progress_call_ids and progress_updates < 4):
+                                    args = call.get("args")
+                                    summary = args.get("summary") if isinstance(args, dict) else None
+                                    if isinstance(summary, str) and summary.strip():
+                                        progress_call_ids.add(call_id)
+                                        progress_updates += 1
+                                        phase = args.get("phase")
+                                        visible = (
+                                            f"{phase}：{summary.strip()[:120]}"
+                                            if isinstance(phase, str) and phase in {"理解问题", "查证资料", "权衡方案", "形成回答"}
+                                            else summary.strip()[:120]
+                                        )
+                                        for key, label, limit in (("basis", "依据", 60), ("next_step", "下一步", 45)):
+                                            value = args.get(key)
+                                            if isinstance(value, str) and value.strip():
+                                                visible += f" {label}：{value.strip()[:limit]}"
+                                        await state["on_activity"](
+                                            "progress", "started", {"summary": visible[:240]}
+                                        )
+                                if (call.get("name") == "research" and isinstance(call_id, str)
+                                        and call_id not in research_call_ids):
+                                    research_call_ids.add(call_id)
+                                    await state["on_activity"]("research", "started")
+                    # research 的工具结果已回到主 Agent 消息流；此处只提取状态和来源供 UI 展示。
+                    if state.get("on_activity"):
+                        for tool_message in part["data"].get("tools", {}).get("messages", []):
+                            tool_id = getattr(tool_message, "tool_call_id", None)
+                            if tool_id in research_call_ids:
+                                research_call_ids.remove(tool_id)
+                                step = (
+                                    "failed"
+                                    if getattr(tool_message, "status", "success") == "error"
+                                    else "completed"
+                                )
+                                details = {}
+                                if step == "completed":
+                                    try:
+                                        result = json.loads(tool_message.content)
+                                        if isinstance(result, dict):
+                                            if isinstance(result.get("sources"), list):
+                                                details = {"sources": result["sources"]}
+                                            if result.get("status") == "limited":
+                                                step = "failed"
+                                                details["reason"] = "limited"
+                                    except (TypeError, ValueError):
+                                        pass
+                                await state["on_activity"]("research", step, details)
         except asyncio.CancelledError:
             await asyncio.shield(
                 services.restore_stopped_turn(
