@@ -1,6 +1,6 @@
 # LLM Agent
 
-[English](README.en.md) · [项目进度](docs/TODO.md)
+[English](README.en.md) · [项目进度](docs/TODO.md) · [功能改动时间线](docs/change_history.md)
 
 基于 FastAPI、LangChain / LangGraph 的聊天 Agent 实验项目，探索流式响应、PostgreSQL 会话恢复与 Milvus 长期记忆。
 
@@ -145,5 +145,6 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上十组离
 - [学习进度路线](docs/learning_progress_roadmap.md) 与 [Agent 学习路线](docs/agent_learning_roadmap.md)：分阶段学习计划。
 - [网关基建与评测路线](docs/gateway_evaluation_roadmap.md)：API、模型与工具边界，以及运行和质量指标。
 - [反馈回归流程](docs/feedback_regression.md)：用户负反馈的审核、脱敏和版本对比。
+- [文档整理规划](docs/documentation_reorganization_plan.md)：当前文档的合并、拆分、归档及迁移顺序。
 
 主要代码入口为 [API](api/server.py)、[Agent](src/agent/main.py)、[记忆工具](src/agent/tools.py) 和 [独立 Graph 示例](src/agent/graph.py)。
