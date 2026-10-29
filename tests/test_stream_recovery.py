@@ -161,7 +161,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.state_updates), 1)
         self.assertEqual(memory_updates, [])
 
-        status, answer = await streamer(
+        status, answer, memory_status = await streamer(
             "同会话重试",
             "session-1",
             "user-1",
@@ -169,6 +169,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
             on_token,
         )
         self.assertEqual((status, answer), ("done", "恢复后的完整回答"))
+        self.assertEqual(memory_status, "skipped")
         self.assertEqual(
             [(item.type, item.content) for item in agent.messages],
             [
@@ -190,7 +191,7 @@ class StreamRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("src.agent.chat_workflow", level="ERROR"):
             self.assertEqual(
                 await streamer("新问题", "session-2", "user-1", agent, ignore_token),
-                ("done", "恢复后的完整回答"),
+                ("done", "恢复后的完整回答", "failed"),
             )
 
         self.assertEqual(
