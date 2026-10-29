@@ -1,6 +1,8 @@
 # JWT 学习与本项目集成指南
 
-本文先介绍 JWT 的组成和验证方式，再记录项目的本地实现与剩余验收。当前代码已有用户表、注册/登录、JWT 签发与验证，以及 `/chat`、路径、主题、任务接口的认证/所有权代码。前端接入、双用户端到端隔离及生产密钥管理仍未验收，因此不能据此认定服务已可对外部署。
+**当前身份指南，核对日期：2026-10-29。** 原逐行实施草案见 [历史指南](jwt_implementation_guide.md)。独立 React 前端已有登录和 Bearer 请求代码，但双用户真实环境验收尚由用户安排。
+
+本文先介绍 JWT 的组成和验证方式，再记录项目的本地实现与剩余验收。当前代码已有用户表、注册/登录、JWT 签发与验证，以及 `/api/chat`、路径、主题、任务接口的认证/所有权代码。独立前端已有登录和 Bearer 请求代码；双用户端到端隔离及生产密钥管理仍未验收，因此不能据此认定服务已可对外部署。
 
 ## JWT 是什么
 
@@ -45,14 +47,14 @@ Authorization: Bearer <access_token>
 
 ## 当前项目的身份问题
 
-原版 [api/server.py](../api/server.py) 的 `ChatRequest` 要求客户端提交 `user_id`，该值参与 checkpoint 线程 ID、锁 ID、聊天日志和记忆逻辑。当前代码已移除这一请求字段，改用 JWT `sub`；前端调用是否同步更新尚未在此仓库验证。复合线程 ID 本身仍只是状态隔离键，不能替代身份认证和资源授权。
+原版 [api/server.py](../api/server.py) 的 `ChatRequest` 要求客户端提交 `user_id`，该值参与 checkpoint 线程 ID、锁 ID、聊天日志和记忆逻辑。当前代码已移除这一请求字段，改用 JWT `sub`；独立前端已改为 Bearer 请求，但真实联调仍由用户安排。复合线程 ID 本身仍只是状态隔离键，不能替代身份认证和资源授权。
 
 当前 [paths.py](../api/routers/paths.py)、[topics.py](../api/routers/topics.py)、[tasks.py](../api/routers/tasks.py) 已加入认证依赖，并通过 `LearningPath.owner_id` 检查父级归属；完整路由覆盖和跨用户访问仍需自动化与端到端验证。
 
 当前代码已选择自建登录，加入 `User` 表、Argon2 密码哈希、`/api/auth/register`、`/api/auth/login` 和 `/api/auth/me`。生产部署仍需决定是否继续维护自建身份，或迁移到 OIDC：
 
 1. **推荐上线方案：**接入托管或自建 OIDC 身份提供方，由它完成登录和令牌签发，FastAPI 校验其签名及 `iss`、`aud`，并将稳定的 `sub` 映射为项目用户 ID。
-2. **学习用自建方案：**增加用户表和注册/登录流程，安全地哈希并验证密码，再由服务端签发短期访问 JWT。不能把客户端随便传来的 UUID 直接签成登录令牌。
+2. **当前学习用自建方案：**现有用户表和注册/登录流程安全地哈希并验证密码，再由服务端签发短期访问 JWT。不能把客户端随便传来的 UUID 直接签成登录令牌。
 
 ## 集成到项目的目标结构
 
@@ -177,13 +179,13 @@ async def chat_api(
 登录成功后，前端得到 access token；聊天请求保持 POST SSE，不改成原生 `EventSource`：
 
 ```ts
-await fetch(`${API_URL}/chat`, {
+await fetch(`${API_URL}/api/chat`, {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
   },
-  body: JSON.stringify({ message, session_id: sessionId }),
+  body: JSON.stringify({ message, session_id: sessionId, request_id: requestId }),
 });
 ```
 
@@ -191,8 +193,8 @@ await fetch(`${API_URL}/chat`, {
 
 ## 剩余实施与验收顺序
 
-1. **核对本地实现。**审查注册/登录、JWT 验证、`/chat` 和每个资源路由的所有权判断；确认已有代码与配置实际可运行。
-2. **完成前端接入。**增加登录状态和 token 生命周期处理；移除 `localStorage.user_id` 作为身份来源；为普通 API 与 SSE fetch 附加 Authorization Header。
+1. **核对本地实现。**审查注册/登录、JWT 验证、`/api/chat` 和每个资源路由的所有权判断；确认已有代码与配置实际可运行。
+2. **核对前端接入。**现有登录状态和 Bearer 调用代码已接入独立前端；实际确认 token 生命周期、401 提示、刷新恢复，以及普通 API 与 SSE 请求的 Authorization Header。
 3. **补齐自动回归。**测试缺 token、格式错误、签名错误、过期 token、错误 issuer/audience 均返回 401；有效 token 能访问自己的数据；用户 A 无法读取或修改用户 B 的 checkpoint、记忆、路径、主题和任务。
 4. **端到端验收。**用两个用户分别登录，验证聊天历史、SSE、停止和重试、长期记忆以及学习路径的隔离；确认刷新后会话恢复行为符合 token 生命周期设计。
 5. **确定部署身份方案。**若继续自建登录，补充生产密钥托管、轮换和撤销；若改用 OIDC，重新验证签名算法、issuer、audience 与稳定用户 ID 映射。

@@ -1,5 +1,7 @@
 # 正式聊天业务图
 
+当前实现说明，更新于 2026-10-29。历史接入过程见 [迁移记录](history/chat_graph_migration.md)。会话和事件表见 [数据结构](session_current.md)。
+
 `/api/chat` 由 [api/server.py](../api/server.py) 调用 `chat_stream()`，后者运行 [chat_workflow.py](../src/agent/chat_workflow.py) 的请求级 `StateGraph`：
 
 ```text
@@ -16,7 +18,9 @@
 - `resolve`：查询同类旧记忆，批量验证 `none`、`insert`、`replace` 决策及替换目标；验证失败时不写入。
 - `persist`：将有效决策写入 Milvus；`none` 不写入。
 
-外层图每次调用使用新的临时状态，不另建 checkpoint；主 Agent 继续用 `make_thread_id(user_id, session_id)` 保存对话历史。检索 Agent 每次独立执行，结果以工具摘要进入主 Agent 的会话。召回或回答失败会使请求失败；回答后的记忆阶段失败会记录异常并保留回答。记忆写入不自动重试。具体修改和验证见 [迁移记录](chat_graph_migration.md)。
+执行过程由 `api/chat_stream.py` 将 `research`、`answer`、`memory` 阶段写入 `chat_run_events`，数据库提交后再发 `agent_step`。主 Agent 的 `report_progress` 也记录为用户可见的 `answer/started` 摘要；模型可能不调用它，不能把摘要称为内部逐字推理。历史读取在归属校验后批量附上事件。前端展示说明见[当前接入](../../web/my-app/docs/chat_current.md)。
+
+外层图每次调用使用新的临时状态，不另建 checkpoint；主 Agent 继续用 `make_thread_id(user_id, session_id)` 保存对话历史。检索 Agent 每次独立执行，结果以工具摘要进入主 Agent 的会话。召回或回答失败会使请求失败；回答后的记忆阶段失败会记录异常并保留回答。记忆写入不自动重试。具体修改和当时的验证见 [迁移记录](history/chat_graph_migration.md)。
 
 ## 主 Agent 与检索子 Agent 如何通信
 

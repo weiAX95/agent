@@ -1,6 +1,10 @@
 # 会话与消息表设计（V0.1）
 
-日期：2026-10-23。状态：数据库结构已实施；2026-10-26 已接入新会话后端存储，历史查询/前端与旧数据导入尚未实施。可重跑迁移文件为 `migrations/20261023_chat_history.sql`。以下 DDL 用于说明设计，不要在已建表的数据库重复执行 CREATE TABLE。
+**历史设计稿。** 当前已实施的表、接口和执行事件见 [当前会话数据结构](session_current.md)。本文保留 2026-10-23 的设计背景；后续的未实施判断、建议分页数字和首版 DDL 不代表当前代码。
+
+初稿日期：2026-10-23；当前状态核对：2026-10-29。会话创建、本人历史列表、消息分页、前端刷新恢复、记忆结果和执行事件已有代码；真实体验由用户按需验收。旧数据导入仍未实施。实际表定义以 [ORM](../api/models.py) 和 [迁移文件](../migrations/) 为准；下方首版 DDL 保留设计背景，**不含后来增加的 `memory_status` 与 `chat_run_events`，不要在现有库重复执行**。
+
+当前增量：`chat_messages.memory_status` 记录记忆处理结果；`chat_run_events` 按 assistant message、sequence 保存阶段、状态、摘要、来源与时间。对应迁移分别为 [记忆状态](../migrations/20261027_chat_memory_status.sql) 和 [执行事件](../migrations/20261027_chat_run_events.sql)。`GET /api/sessions/{id}/messages` 在校验会话归属后批量带回事件。前端初次取最近 100 条，旧消息按需加载。
 
 ## 范围和关系
 
@@ -15,7 +19,7 @@ users 1 → N chat_sessions 1 → N chat_messages。
 
 消息表是 UI 展示记录，checkpoint 是模型执行上下文，两者不是相互替代关系。不得仅用 UI 消息重建上下文，以免丢失工具消息。
 
-## 建议 DDL
+## 首版 DDL（历史设计，当前表还包含后续迁移）
 
 ID 由应用生成，避免引入数据库 UUID 扩展依赖。全部业务时间使用 timestamptz，存储绝对时间、展示时转换为用户时区。
 

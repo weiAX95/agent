@@ -1,6 +1,6 @@
 # LLM Agent
 
-[English](README.en.md) · [项目进度](docs/TODO.md) · [功能改动时间线](docs/change_history.md)
+[English](README.en.md) · [文档导航](docs/index.md) · [产品进度](tasks/plan.md) · [功能改动时间线](docs/change_history.md)
 
 基于 FastAPI、LangChain / LangGraph 的聊天 Agent 实验项目，探索流式响应、PostgreSQL 会话恢复与 Milvus 长期记忆。
 
@@ -96,7 +96,7 @@ curl -N -X POST http://127.0.0.1:8000/api/chat \
 
 正式聊天流程由 [请求级业务图](src/agent/chat_workflow.py) 编排召回、回答和长期记忆维护；图本身不另存 checkpoint。同步调用与 POST SSE 接口共享这些阶段，流式 token、断线停止和失败清理仍由原有 Agent 流处理。回答后的记忆维护失败会记录服务端异常并保留回答；节点与验证范围见 [迁移记录](docs/chat_graph_migration.md)。
 
-**调用合约变化（2026-10-26）**：`/api/chat` 现在要求先创建会话并提供 `request_id`。现有 React 前端尚未适配，直接发送旧请求会被拒绝；本轮仅交付后端与接口验证。
+**当前调用合约**：`/api/chat` 要求先创建会话并提供 `request_id`。独立 React 前端已经接入该流程、历史会话和执行过程展示；前端不在本仓库 Git 提交中，真实环境体验仍由用户按需验收。详见[前端当前接入说明](../web/my-app/docs/chat_current.md)。
 
 独立的 React 前端位于 `/Users/zhangweiwei/Desktop/code/web/my-app`。新版本的 `done` / `stopped` 事件附带 `chat_log_id`；页面可将回答问题或记忆问题提交到 `POST /api/feedback`，由服务端按当前用户验证记录归属。人工脱敏、回归样本提升及基线对比命令见 [反馈回归流程](docs/feedback_regression.md)。
 
@@ -138,6 +138,7 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上十组离
 
 ## 项目文档
 
+- [文档导航](docs/index.md)：当前规范、历史记录与学习材料的入口。
 - [问题与改进 TODO](docs/TODO.md)：问题状态、验收条件和后续工作。
 - [自动召回学习文档](docs/auto_recall.md)：长期记忆读取、向量检索与 Graph 改造。
 - [聊天业务图](docs/graph.md) 与 [迁移记录](docs/chat_graph_migration.md)：正式流程的节点、失败边界和验证。

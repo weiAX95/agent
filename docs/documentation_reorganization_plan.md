@@ -1,6 +1,6 @@
 # 文档合并与拆分实施计划
 
-更新日期：2026-10-29。代码基线：`ca7ccbc`（主子 Agent 与执行过程）、`3841ed8`（流式恢复断言）。本文是**文档改造计划**，尚未按计划迁移正文。功能代码已提交；前端 `../web/my-app` 不是 Git 仓库，不在这两笔提交中。
+更新日期：2026-10-29。代码基线：`ca7ccbc`（主子 Agent 与执行过程）、`3841ed8`（流式恢复断言）。本文兼作迁移记录。前端 `../web/my-app` 不是 Git 仓库，不在这两笔提交中。
 
 ## 整理原则
 
@@ -13,42 +13,42 @@
 
 | 读者的问题 | 唯一当前入口 | 其他文档的角色 |
 | --- | --- | --- |
-| 现在要做什么？ | `tasks/plan.md`（版本路线）、`tasks/todo.md`（执行项） | `docs/TODO.md` 仅作为工程问题台账，计划改名 `docs/known_issues.md`。 |
+| 现在要做什么？ | `tasks/plan.md`（版本路线）、`tasks/todo.md`（执行项） | `docs/TODO.md` 仅作为工程问题台账，保留原路径以免打断旧链接。 |
 | 之前哪天改了什么？ | `docs/change_history.md` | 提交号与带日期实施记录作为证据。 |
-| 正式聊天/主子 Agent 如何运行？ | `docs/graph.md` | `docs/chat_graph_migration.md`、`tasks/execution_timeline_goal.md` 是实施记录，不重复维护当前流程。 |
-| 会话和消息怎样存？ | `docs/chat_session_schema.md` | `docs/session_storage_delivery.md`、`tasks/session_storage_goal.md` 是交付记录；当前表结构只在 schema 文档维护。 |
-| 记忆怎样读写、跨会话生效？ | 拟新建 `docs/memory_current.md` | `docs/auto_recall.md` 留学习原理与独立 Graph 练习；`docs/cross_session_memory_acceptance.md` 保留验收场景。 |
-| JWT 身份当前怎样接？ | `docs/jwt_auth.md` | `docs/jwt_implementation_guide.md` 是历史实施草案，不再提供当前逐行操作步骤。 |
+| 正式聊天/主子 Agent 如何运行？ | `docs/graph.md` | `docs/history/chat_graph_migration.md`、`tasks/execution_timeline_goal.md` 是实施记录，不重复维护当前流程。 |
+| 会话和消息怎样存？ | `docs/session_current.md` | `docs/chat_session_schema.md` 是首版设计；`docs/history/session_storage_delivery.md`、`tasks/session_storage_goal.md` 是交付记录。 |
+| 记忆怎样读写、跨会话生效？ | `docs/memory_current.md` | `docs/auto_recall.md` 留学习原理与独立 Graph 练习；`docs/cross_session_memory_acceptance.md` 保留验收场景。 |
+| JWT 身份当前怎样接？ | `docs/jwt_auth.md` | `docs/history/jwt_implementation_guide.md` 是历史实施草案，不再提供当前逐行操作步骤。 |
 | 怎样处理反馈和网关？ | `docs/feedback_regression.md`、`docs/gateway_evaluation_roadmap.md` | 两者用途独立；实施状态只更新执行清单。 |
-| 怎样学习 Agent？ | 拟将 `docs/learning_progress_roadmap.md` 缩为唯一当前学习路线 | `docs/agent_learning_roadmap.md` 保留为 2026-09-12 历史学习稿；旧快照不标成当前进度。 |
-| 如何使用独立的前端聊天？ | 拟新建 `../web/my-app/docs/chat_current.md` | 前端原接入教程与执行记录保留为历史资料。 |
+| 怎样学习 Agent？ | `docs/learning_current.md` | 两份原学习路线移入 `docs/history/`，旧路径保留导航。 |
+| 如何使用独立的前端聊天？ | `../web/my-app/docs/chat_current.md` | 前端原接入教程与执行记录移入其 `docs/history/`。 |
 
 ## 分批实施
 
 ### 第 1 批：纠正入口与状态，不搬文件
 
-- [ ] 新建 `docs/index.md`，按“当前规范、执行记录、学习资料、实验”列出所有文档和最后核对日期；README 指向该索引。
-- [ ] 修正 README 中“前端尚未适配”等过期说法；将主子 Agent、执行过程和新迁移的当前状态写清，同时标注前端不在本仓库提交中。
-- [ ] `docs/TODO.md` 顶部说明它是工程问题台账，具体产品任务以 `tasks/todo.md` 为准；之后再决定是否改名。
-- [ ] 给 `docs/jwt_implementation_guide.md`、两份学习路线的历史段落添加“历史资料/当前入口”提示，不在这一批删正文。
+- [x] 新建 `docs/index.md`，按当前实现、记录、学习资料列出文档；README 指向索引。
+- [x] 修正 README 中“前端尚未适配”的过期说法，标注前端不在本仓库 Git 提交中。
+- [x] `docs/TODO.md` 顶部说明它是工程问题台账，产品任务以 `tasks/todo.md` 为准。
+- [x] 两份学习路线与 JWT 原实施草案移入 `docs/history/`，旧路径保留导航。
 
 ### 第 2 批：合并正式聊天与会话说明
 
-- [ ] 以 `docs/graph.md` 为正式架构入口，补齐 `ca7ccbc` 的事件表、SSE、历史读取和失败状态；从 `docs/chat_graph_migration.md` 只提取仍适用的设计结论，保留迁移记录本身。
-- [ ] 以 `docs/chat_session_schema.md` 为当前数据库契约，更新 10 月 26—29 日已实施状态；将 `docs/session_storage_delivery.md` 和 `tasks/session_storage_goal.md` 标为完成记录，旧状态加历史标注。
-- [ ] 前端生成 `../web/my-app/docs/chat_current.md`：集中当前请求地址、会话恢复、历史按需加载、执行过程事件。旧 `chat-session-integration.md`、`chat-integration-progress.md` 留作带日期的接入记录；`session-restore.md`、`research-agent-integration.md`、`execution-timeline-ui.md` 中仍有效的内容并入当前指南后留简短入口。
+- [x] 以 `docs/graph.md` 为正式架构入口，补上执行事件、SSE 与历史读取；Graph 迁移记录移入历史目录。
+- [x] 新建 `docs/session_current.md` 作为当前数据库契约；首版 DDL 留在设计稿，会话存储交付记录移入历史目录。
+- [x] 前端新建 `../web/my-app/docs/chat_current.md`，集中当前请求、会话和执行过程；首版教程及进度记录移入前端历史目录，旧路径保留导航。
 
 ### 第 3 批：拆分超长文档
 
-- [ ] `docs/auto_recall.md`（约 615 行）：正式 Milvus 记忆读写、用户隔离和排障提炼为 `docs/memory_current.md`；原理实验和独立 Graph 练习保留在原文并明确不是 `/api/chat` 的入口。
-- [ ] `docs/jwt_implementation_guide.md`（约 1005 行）：仅保留为历史实施草案；将仍有效的身份来源、令牌和权限边界归入 `docs/jwt_auth.md`，不把大段旧代码复制过去。
-- [ ] `docs/learning_progress_roadmap.md`（约 853 行）与 `docs/agent_learning_roadmap.md`（约 317 行）：合并当前阶段、代码证据和下一步，删除重复课程目录；历史快照留在原文并从索引标为历史。不把两篇全文拼接。
+- [x] 从 `docs/auto_recall.md` 提炼当前记忆读写、用户隔离和排障入口至 `docs/memory_current.md`；原理与独立 Graph 练习留原文。
+- [x] `docs/jwt_implementation_guide.md` 移入历史目录；当前身份边界由 `docs/jwt_auth.md` 维护。
+- [x] 两份旧学习路线移入历史目录，当前阶段与下一步合并至 `docs/learning_current.md`，不拼接旧全文。
 
 ### 第 4 批：清理重复与收尾
 
-- [ ] `docs/TODO.md` 如改名为 `docs/known_issues.md`，先更新所有入链和 README，再在原路径保留导航页；产品执行状态只在 `tasks/todo.md` 勾选。
-- [ ] `docs/feedback_regression.md`、`docs/gateway_evaluation_roadmap.md`、`docs/cross_session_memory_acceptance.md` 保留独立，不强行合并；只补到索引和当前架构文档的交叉链接。
-- [ ] `docs/codex_deepseek_fallback.md` 标记为独立实验；核定 `docs/test.pdf` 的用途和来源后再决定是否索引或移出，不直接删除。
-- [ ] 核对 README、后端和前端文档的相对链接；确认旧路径能找到新入口、历史日期仍可追溯，之后才删除真正重复的正文。
+- [x] `docs/TODO.md` 保持原路径，明确定位为工程问题台账；产品执行状态只在 `tasks/todo.md` 勾选，避免为改名制造额外链接迁移。
+- [x] `docs/feedback_regression.md`、`docs/gateway_evaluation_roadmap.md`、`docs/cross_session_memory_acceptance.md` 保留独立；索引和当前说明已给出各自入口。
+- [x] `docs/codex_deepseek_fallback.md` 标记为未提交的独立实验，不纳入当前导航；`docs/test.pdf` 由 PDF 解析示例引用且被 Git 忽略，保留为本地示例输入。
+- [x] 核对 README、后端和前端文档的相对链接；旧路径均有新入口，历史日期仍可追溯。
 
-每批独立提交文档，提交说明写明“当前入口”与被标为历史的文档。用户负责真实功能测试；文档整理不触碰运行代码，也不把未验收功能写成已验收。
+迁移分批核对，文档改动统一提交时写明“当前入口”与被标为历史的文档。用户负责真实功能测试；文档整理不触碰运行代码，也不把未验收功能写成已验收。
