@@ -40,7 +40,7 @@
 
 - [x] 让每条新增记忆拥有独立主键，并在已有同类记忆时允许 `insert` 决策。
 - [ ] 在真实 Milvus 上验证旧固定主键记录与新 UUID 记录共存。
-- **位置**：[tools.py](../src/agent/tools.py) 的 `_insert_memory()`、`save_to_memory()`；[main.py](../src/agent/main.py) 与 [graph.py](../src/agent/graph.py) 的 `insert` 分支。
+- **位置**：[store.py](../src/agent/memory/store.py) 的 `_insert_memory()`、`save_to_memory()`；[decisions.py](../src/agent/memory/decisions.py) 与 [graph.py](../examples/agent/graph.py) 的 `insert` 分支。
 - **原现象 / 触发条件**：主键只由 `user_id + memory_key` 生成，再执行 `upsert`。同一用户、同一类别下新增“喜欢咖啡”和“喜欢茶”两个独立事实时，第二次会覆盖第一次；“独立主键”的注释与实现不一致。
 - **修复步骤**：保留 `memory_key` 作为分类字段，为每条新增事实生成独立 ID；新增使用插入语义，更新使用明确的旧 ID。与 BUG-05 一起修改主入口、Graph 和工具签名，并制定已有固定主键记录的兼容或迁移方案。
 - **当前实现**：`_insert_memory()` 用 UUID 和 `insert`；按 `user_id + memory_key` 字段读取全部记录，因此旧固定主键无需迁移即可参与判断；主流程对同类独立事实允许 `insert`。同一条消息中的同类多个候选事实仍受 `judge_memory()`“每 key 最多一项”的限制。
@@ -50,16 +50,16 @@
 ### BUG-03 · P1 · 包导入依赖启动目录
 
 - [ ] 统一包结构、导入方式和启动命令。
-- **位置**：[server.py](../api/server.py) 的项目根目录 `sys.path` 补丁；[graph.py](../src/agent/graph.py)、[smith.py](../src/agent/smith.py) 的裸模块导入；[Graph 示例](../src/agent/test/test_graph.py)、[数据查看脚本](../src/agent/test/showData.py) 等。
-- **现象 / 触发条件**：API 目前通过项目根目录 `sys.path` 补丁导入 `src.agent.main`；Graph 仍使用 `from model import model` 等裸模块导入。不同入口依赖不同的启动目录或搜索路径，尚未形成统一可安装的包结构。
+- **位置**：[server.py](../api/server.py) 的项目根目录 `sys.path` 补丁；[Graph 示例](../examples/agent/graph.py)、[数据查看脚本](../examples/agent/demos/show_memory_demo.py) 等现已使用包导入。
+- **现象 / 触发条件**：正式模块和 Graph 示例已统一为包导入，API 仍保留项目根目录 `sys.path` 补丁；尚未验证可安装包及不同启动目录。示例请从项目根目录以 `python -m examples.agent.demos.<模块名>` 启动。
 - **修复步骤**：将项目配置为可安装的包，或统一使用与当前布局匹配的包导入；同步修正内部相对导入、API 和示例，移除不再需要的 `sys.path` 补丁；记录根目录启动命令。
 - **验收条件**：干净环境中，从根目录按文档启动 API、导入 Graph 和运行示例不出现 `ModuleNotFoundError`；不需要切换到 `src/agent/`。先配合 IMP-01 避免离线导入触发外部初始化。
 
 ### BUG-04 · P1 · 主入口没有主动加载 `.env`
 
 - [ ] 统一加载并校验模型配置。
-- **位置**：[main.py](../src/agent/main.py) 的模块级 `init_chat_model()`；[model.py](../src/agent/model.py) 的 `dotenv.load_dotenv()`。
-- **现象 / 触发条件**：主入口直接读取 `os.getenv("OPENAI_MODEL")` 等值，其导入链没有加载 `.env`；另一条 Graph 入口才加载了它。只配置 `.env`、没有导出进程环境变量时，主入口可能读到空值，缺少模型名时无法正常聊天。先排除 BUG-03 及外部初始化问题。
+- **位置**：[llm.py](../src/agent/llm.py) 的 `get_llm()`；[model.py](../examples/agent/model.py) 的 `dotenv.load_dotenv()`。
+- **现象 / 触发条件**：正式 API 在导入 Agent 前加载根目录 `.env`，模型在应用启动时创建；直接从其他入口调用 `get_llm()` 仍依赖进程环境。Graph 示例有独立的 `.env` 加载方式，配置命名尚未统一。
 - **修复步骤**：建立共同配置入口，在创建模型前加载约定位置的 `.env`；校验必填项、明确环境变量优先级，不打印凭证。统一项目中的 `OPENAI_BASE_URL` / `OPENAI_API_BASE_URL` 命名，按需兼容旧名。
 - **边界说明**：命名不统一是维护问题，不能据此断言 SDK 的环境变量回退机制无效。
 - **验收条件**：仅配置 `.env` 能得到正确配置；显式环境变量按约定覆盖；缺少必填项时清晰报错；日志不包含 API Key。
@@ -68,7 +68,7 @@
 
 - [x] 按选中的旧记录 ID 更新记忆，并校验目标归属。
 - [ ] 在真实 Milvus 上验证 UUID 与旧固定主键记录的更新。
-- **位置**：[graph.py](../src/agent/graph.py) 的 `persist_memory_node()`；[tools.py](../src/agent/tools.py) 的 `replace_memory()`；[main.py](../src/agent/main.py) 的 resolution 结构和替换分支；[旧记录准备脚本](../src/agent/test/test_replace_prepare.py)。
+- **位置**：[graph.py](../examples/agent/graph.py) 的 `persist_memory_node()`；[store.py](../src/agent/memory/store.py) 的 `replace_memory()`；[decisions.py](../src/agent/memory/decisions.py) 的 resolution 结构和替换分支；[旧记录准备脚本](../examples/agent/demos/replace_prepare_demo.py)。
 - **原现象 / 触发条件**：Graph 校验了 resolver 返回的 `memory_id`，却未传给替换函数；后者重新计算固定主键。替换准备脚本中的 UUID 记录时，会在另一 ID 上写入新事实，旧记录仍保留。主入口的 resolution 结构也没有明确选择目标 ID。
 - **修复步骤**：替换函数显式接收 `memory_id`，确认目标存在且属于当前用户后再更新。Graph 传递已校验目标；主入口结构化决策也携带并校验目标 ID。与 BUG-02 一起明确新增、替换、无操作语义，不能将目标不存在静默当成新增。
 - **当前实现**：主流程批量决策携带 `memory_id`，写入前核对类别、数量和目标 ID；Graph 将选中的 ID 传给 `replace_memory()`；工具再次查询目标并校验用户与类别，然后复用原 ID 更新文本和向量。
@@ -78,7 +78,7 @@
 ### BUG-06 · P2 · Graph 消息字段没有合并规则
 
 - [ ] 为多轮消息配置正确的 reducer。
-- **位置**：[schemas.py](../src/agent/schemas.py) 的 `AgentState.messages`；[graph.py](../src/agent/graph.py) 的 `agent_node()`。
+- **位置**：[schemas.py](../examples/agent/schemas.py) 的 `AgentState.messages`；[graph.py](../examples/agent/graph.py) 的 `agent_node()`。
 - **现象 / 触发条件**：`messages` 是普通列表。启用 checkpoint 后，第二次只提交新用户消息时，该列表会替换原列表，导致多轮上下文丢失。
 - **修复步骤**：使用 `MessagesState`，或为 `messages` 配置 `Annotated[..., add_messages]`；检查节点返回完整历史还是本轮增量，以及消息 ID 是否稳定，防止修复覆盖后又引入重复追加。
 - **验收条件**：同一线程两轮调用只提交新消息也能保留历史；消息不重复；不同线程不共享消息；工具调用及对应响应顺序完整。
@@ -86,7 +86,7 @@
 ### BUG-07 · P1 · Graph 工具调用没有绑定可信 `user_id`
 
 - [ ] 从运行上下文为记忆工具注入当前用户身份。
-- **位置**：[graph.py](../src/agent/graph.py) 的 `agent_node()`；[smith.py](../src/agent/smith.py) 的 agent；[tools.py](../src/agent/tools.py) 的 `search_memory(user_id, query)`。
+- **位置**：[graph.py](../examples/agent/graph.py) 的 `agent_node()`；[smith.py](../examples/agent/smith.py) 的 agent；[tools.py](../src/agent/tools.py) 的 `search_memory(user_id, query)`。
 - **现象 / 触发条件**：外层 state 有 `user_id`，但内部 agent 只收到 `messages`；记忆工具要求模型自行填写 `user_id`。身份没有被程序绑定，模型可能无法构造正确查询或填入错误身份。主入口把 ID 写进 system message 也只是提示，不能代替工具层校验。
 - **修复步骤**：用运行上下文、工具包装器或依赖注入绑定服务端确定的身份；从模型参数中移除 `user_id`，或执行前强制校验/覆盖。自动召回、主动搜索、保存和替换使用同一可信身份来源，与 BUG-01 一致。
 - **验收条件**：内部工具使用的身份始终等于外层可信身份；模型或用户文本填写其他 ID 不能改变查询范围；覆盖自动召回与主动工具搜索两条路径。
@@ -96,7 +96,7 @@
 - [x] 明确声明当前直接使用的 `langchain`、`langgraph` 和 PostgreSQL checkpoint 依赖。
 - [ ] 在干净环境中验证完整依赖安装、导入和离线测试。
 - [ ] 解决依赖冲突：`gradio==6.8.0` 要求 `aiofiles<25`，而当前 `unstructured-client==0.46.2` 要求 `aiofiles>=25.1.0`；本地 `pip check` 因此仍失败。评估是否拆分服务/解析环境或选择兼容版本，再重建依赖锁定文件。
-- **位置**：[requirements.txt](../requirements.txt)；[main.py](../src/agent/main.py)、[graph.py](../src/agent/graph.py)、[smith.py](../src/agent/smith.py) 的 `langchain` / `langgraph` 导入。
+- **位置**：[requirements.txt](../requirements.txt)；[main.py](../src/agent/main.py)、[graph.py](../examples/agent/graph.py)、[smith.py](../examples/agent/smith.py) 的 `langchain` / `langgraph` 导入。
 - **原现象 / 触发条件**：清单曾包含多个 LangChain 子包，却未直接声明使用的 `langchain` 和 `langgraph`。当前环境已安装的包可能掩盖问题；不能依赖偶然的传递依赖保证直接使用的模块可用。
 - **当前处理与后续**：清单现已列出 `langchain`、`langgraph`、`langgraph-checkpoint-postgres` 及 psycopg 依赖。仍需在干净环境验证版本兼容，并区分服务运行、解析和开发测试依赖；Python 版本、嵌入模型及 Milvus 等外部条件见项目说明。
 - **验收条件**：新建环境仅按文档安装后，依赖检查通过、直接使用模块可导入、离线测试通过。模型文件和外部服务另行准备，不混同于包安装成功。
@@ -128,7 +128,7 @@
 ### BUG-12 · P2 · Graph 示例缺少 checkpoint 配置
 
 - [ ] 给 Graph 调用提供 `configurable.thread_id`。
-- **位置**：[test_graph.py](../src/agent/test/test_graph.py) 的 `graph.invoke()`；[graph.py](../src/agent/graph.py) 的图编译。
+- **位置**：[memory_graph_demo.py](../examples/agent/demos/memory_graph_demo.py) 的 `graph.invoke()`；[graph.py](../examples/agent/graph.py) 的图编译。
 - **现象 / 触发条件**：Graph 使用 `InMemorySaver`，示例却没有传 checkpoint 配置。state 里的 `session_id` 不会自动变成 config 中的 `thread_id`；修复导入后仍会遇到 checkpoint 配置错误。
 - **修复步骤**：显式传 config，使用 BUG-01 的统一身份/会话标识；说明业务 state 与执行 config 的区别；将顶层执行整理为明确测试或演示入口。
 - **验收条件**：使用假模型和存储能执行一轮并按 thread ID 取回状态；两轮验证满足 BUG-06；只导入示例不触发外部请求。
@@ -148,8 +148,8 @@
 ### IMP-01 · P2 · 区分离线测试、集成测试与演示
 
 - [ ] 消除测试收集和模块导入时的外部副作用。
-- **位置**：[tools.py](../src/agent/tools.py)、[main.py](../src/agent/main.py)、[test_api.py](../tests/test_api.py)、[test_search.py](../tests/test_search.py)、[Graph 测试目录](../src/agent/test/)。
-- **现状**：工具模块导入时加载 embedding、连接 Milvus 并可能建集合；一些 `test_*.py` 在顶层访问服务、调用模型或写数据库。默认测试收集可能触发真实请求或因服务缺失失败。
+- **位置**：[Milvus 初始化](../src/agent/memory/client.py)、[模型初始化](../src/agent/llm.py)、[模型 API 演示](../examples/agent/demos/model_api_demo.py)、[搜索演示](../examples/agent/demos/search_demo.py)、[Graph 演示目录](../examples/agent/demos/)。
+- **现状**：正式 Agent 的模型、Embedding 和 Milvus 已延后至应用启动；两份导入即访问外部服务的脚本已移出 `tests/`。仍需由用户验证干净环境中的默认收集与真实启动。
 - **实施步骤**：依赖构造移到工厂或应用生命周期；注入模型、embedding 和存储；手动演示使用显式入口；离线测试使用 fake/mock，集成测试单独标记并使用临时资源，写库准备脚本不参与默认收集。
 - **验收条件**：没有真实 Key、模型和数据库时，默认收集和离线测试通过；集成测试须明确选择；假客户端可以验证过滤、新增、替换和阈值行为。
 
@@ -161,7 +161,7 @@
 - [x] `/chat` 用 PostgreSQL 事务级 advisory lock 串行化同一用户/会话的请求，锁持有到 `ChatLog` 提交。
 - [ ] 使用完整 API、真实模型与 Milvus 验证重启、不同用户同名会话和多进程恢复。
 - [ ] 验证同一会话并发、跨 worker 顺序、锁等待超时与高负载延迟，并处理 checkpoint 与 `ChatLog` 不同事务的失败一致性。
-- **位置**：[checkpoint.py](../src/agent/checkpoint.py) 的 `checkpoint_dsn()`、`checkpoint_lock_id()`；[main.py](../src/agent/main.py) 的 `build_agent()`；[server.py](../api/server.py) 的生命周期与 `/chat` 锁；独立 [graph.py](../src/agent/graph.py) 仍使用 `InMemorySaver`。
+- **位置**：[checkpoint.py](../src/agent/checkpoint.py) 的 `checkpoint_dsn()`、`checkpoint_lock_id()`；[main.py](../src/agent/main.py) 的 `build_agent()`；[server.py](../api/server.py) 的生命周期与 `/chat` 锁；独立 [graph.py](../examples/agent/graph.py) 仍使用 `InMemorySaver`。
 - **当前实现**：API 使用现有 `DATABASE_URL`，将 SQLAlchemy 的 asyncpg URL 转成 checkpoint 驱动可用的 PostgreSQL DSN，在应用生命周期中初始化、持有和关闭连接池。启动时的 SQLAlchemy 建表与 `PostgresSaver.setup()` 在固定的事务级 advisory lock 下执行，避免多个 worker 的 checkpoint 迁移竞态。`/chat` 根据用户/会话稳定生成锁键，先在 SQLAlchemy 事务里获取 `pg_advisory_xact_lock`，再调用 Agent，直到日志提交才释放；PostgreSQL 可协调不同 worker 的同一会话请求。`ChatLog` 保留为问答日志，不承担 checkpoint 恢复；旧内存 checkpoint 不自动迁移。
 - **验证记录**：2026-10-02，在真实 PostgreSQL 的临时 schema 执行 `PostgresSaver.setup()`；假聊天模型两轮调用中间关闭并重建连接池，恢复后包含 4 条 human/AI 消息，临时 schema 已删除。FastAPI 实际生命周期启动和 `/health` 返回 HTTP 200；两个真实数据库会话验证同一 advisory lock 会等待前一事务提交。该验证不覆盖完整 `/chat`、真实模型、Milvus、跨用户隔离或并发负载。
 - **后续步骤**：在完整 API 下验证同线程并发顺序及等待上限、多进程部署和高负载行为。checkpoint 使用独立连接池，与日志写入不是单个原子事务；若日志提交失败而 checkpoint 已成功，需要定义重试或补偿策略。如需让独立 Graph 入口持久化，另行设计其状态模型与连接生命周期。

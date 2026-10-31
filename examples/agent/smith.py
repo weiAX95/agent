@@ -1,6 +1,6 @@
 from langchain.agents import create_agent
-from model import model
-from tools import (
+from examples.agent.model import model
+from src.agent.tools import (
     fetch_webpage,
     search_knowledge_base,
     search_memory,

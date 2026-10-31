@@ -1,4 +1,4 @@
-from agent.src.agent.tools import MEMORY_COLLECTION, client
+from src.agent.tools import MEMORY_COLLECTION, client
 
 res = client.query(
     collection_name=MEMORY_COLLECTION,

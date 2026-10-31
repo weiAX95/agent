@@ -1,6 +1,6 @@
 """Offline regression tests for long-term memory writes.
 
-main.py and tools.py initialize the model and Milvus at import time, so these tests
+The production modules initialize the model and Milvus at import time, so these tests
 load only the functions under test and supply in-memory dependencies.
 """
 
@@ -45,7 +45,7 @@ class MemoryExtractionGateTests(unittest.TestCase):
     def test_nonempty_messages_reach_model_without_keyword_or_question_filter(self):
         namespace = {}
         load_definitions(
-            ROOT / "src/agent/main.py", {"should_extract_memory"}, namespace
+            ROOT / "src/agent/memory/decisions.py", {"should_extract_memory"}, namespace
         )
         should_extract = namespace["should_extract_memory"]
         for message in (
@@ -134,7 +134,7 @@ class MemoryUpdateTests(unittest.TestCase):
             "json": json,
         }
         load_definitions(
-            ROOT / "src/agent/tools.py",
+            ROOT / "src/agent/memory/store.py",
             {"_get_memories_by_keys", "_insert_memory", "replace_memory"},
             self.tools,
         )
@@ -163,7 +163,7 @@ class MemoryUpdateTests(unittest.TestCase):
             }
         )
         load_definitions(
-            ROOT / "src/agent/main.py",
+            ROOT / "src/agent/memory/decisions.py",
             {
                 "MemoryKey",
                 "MemoryResolutionItem",
@@ -172,11 +172,13 @@ class MemoryUpdateTests(unittest.TestCase):
                 "MemoryCandidate",
                 "resolve_memories",
                 "validate_memory_resolutions",
-                "_prepare_chat",
-                "chat",
             },
             self.flow,
         )
+        load_definitions(
+            ROOT / "src/agent/memory/context.py", {"_prepare_chat"}, self.flow,
+        )
+        load_definitions(ROOT / "src/agent/main.py", {"chat"}, self.flow)
         self.flow["save_to_memory"] = SimpleNamespace(
             invoke=lambda values: self.tools["_insert_memory"](**values)
         )
@@ -217,7 +219,7 @@ class MemoryUpdateTests(unittest.TestCase):
 
         self.flow["candidate_llm"] = SimpleNamespace(invoke=invoke)
         load_definitions(
-            ROOT / "src/agent/main.py",
+            ROOT / "src/agent/memory/decisions.py",
             {"should_extract_memory", "judge_memory"}, self.flow,
         )
 
@@ -235,7 +237,7 @@ class MemoryUpdateTests(unittest.TestCase):
         self.assertEqual(len(self.candidate_prompts), 1)
 
         load_definitions(
-            ROOT / "src/agent/main.py",
+            ROOT / "src/agent/memory/decisions.py",
             {"should_recall_memory", "route_memory_keys"}, self.flow,
         )
         self.enable_real_extraction([])
@@ -434,7 +436,7 @@ class MemoryUpdateTests(unittest.TestCase):
             "AgentState": dict,
         }
         load_definitions(
-            ROOT / "src/agent/graph.py", {"persist_memory_node"}, graph_namespace
+            ROOT / "examples/agent/graph.py", {"persist_memory_node"}, graph_namespace
         )
         state = {
             "user_id": "user-a",

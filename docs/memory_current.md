@@ -15,4 +15,4 @@
 
 姓名 `user_name`、希望被称呼的方式 `preferred_name` 与饮食偏好 `food_preference` 属于不同类别。“我叫什么”这类明确问句按姓名类别读取；改名走旧记录冲突决策。用户身份来自 JWT，不能由工具调用者随意传入其他用户 ID。
 
-当前实现位置：[业务图](../src/agent/chat_workflow.py)、[召回和提取](../src/agent/main.py)、[Milvus 工具](../src/agent/tools.py)。具体跨会话场景见 [验收记录](cross_session_memory_acceptance.md)。真实模型的提取与召回效果尚需用户按需验收。
+当前实现位置：[业务图](../src/agent/chat_workflow.py)、[召回上下文](../src/agent/memory/context.py)、[判断与提取](../src/agent/memory/decisions.py)、[Milvus 存取](../src/agent/memory/store.py)。具体跨会话场景见 [验收记录](cross_session_memory_acceptance.md)。真实模型的提取与召回效果尚需用户按需验收。

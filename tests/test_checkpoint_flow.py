@@ -115,7 +115,7 @@ class ChatCheckpointTests(unittest.TestCase):
             "should_extract_memory": lambda message: False,
         }
         load_function(
-            ROOT / "src/agent/main.py", "_prepare_chat", self.namespace
+            ROOT / "src/agent/memory/context.py", "_prepare_chat", self.namespace
         )
         attach_chat_workflow(self.namespace)
         self.chat = load_function(ROOT / "src/agent/main.py", "chat", self.namespace)
@@ -404,6 +404,7 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             "AsyncConnectionPool": FakePool,
             "AsyncPostgresSaver": FakeSaver,
             "build_agent": fake_build_agent,
+            "close_agent_resources": lambda: None,
             "settings": SimpleNamespace(
                 database_url="postgresql+asyncpg://u:p@h/db",
                 jwt_verifying_key="test-verifying-key",

@@ -58,15 +58,16 @@
 | 文件与函数 | 阅读重点 |
 | --- | --- |
 | [chat_workflow.py](../src/agent/chat_workflow.py)：`build_chat_workflow` | 正式入口的召回、回答和记忆维护节点及失败边界 |
-| [main.py](../src/agent/main.py)：`chat`、`chat_stream` | 同步与流式入口、回答前召回函数及动态提示 |
-| [main.py](../src/agent/main.py)：`should_recall_memory` | 当前基于关键词的召回开关 |
+| [main.py](../src/agent/main.py)：`chat`、`chat_stream` | 同步与流式入口 |
+| [context.py](../src/agent/memory/context.py)：`_prepare_chat` | 回答前召回与本轮动态提示 |
+| [decisions.py](../src/agent/memory/decisions.py)：`should_recall_memory` | 当前基于关键词的召回开关 |
 | [checkpoint.py](../src/agent/checkpoint.py)：`make_thread_id`、`checkpoint_dsn` | 会话线程隔离，以及把现有 PostgreSQL URL 转为 checkpoint 连接串 |
 | [server.py](../api/server.py)：`lifespan` | 创建、初始化并关闭主 API 的 PostgreSQL checkpoint 连接池和 Agent |
-| [tools.py](../src/agent/tools.py)：`_recall_memories` | 向量化、用户过滤、Top-K 检索、分数过滤 |
-| [tools.py](../src/agent/tools.py)：`search_memory` | 已注册到独立 `smith.py` Agent、未注册到主 API Agent 的记忆工具 |
-| [tools.py](../src/agent/tools.py)：`_get_memories_by_keys` | 按用户与类别读取全部旧记忆，供去重和更新判断 |
-| [tools.py](../src/agent/tools.py)：`_insert_memory`、`replace_memory` | 用独立 ID 新增，以及按已选旧 ID 更新 |
-| [graph.py](../src/agent/graph.py)、[schemas.py](../src/agent/schemas.py)、[smith.py](../src/agent/smith.py) | 另一套 Graph 编排及其状态和工具配置 |
+| [store.py](../src/agent/memory/store.py)：`_recall_memories` | 向量化、用户过滤、Top-K 检索、分数过滤 |
+| [store.py](../src/agent/memory/store.py)：`search_memory` | 已注册到独立 `smith.py` Agent、未注册到主 API Agent 的记忆工具 |
+| [store.py](../src/agent/memory/store.py)：`_get_memories_by_keys` | 按用户与类别读取全部旧记忆，供去重和更新判断 |
+| [store.py](../src/agent/memory/store.py)：`_insert_memory`、`replace_memory` | 用独立 ID 新增，以及按已选旧 ID 更新 |
+| [graph.py](../examples/agent/graph.py)、[schemas.py](../examples/agent/schemas.py)、[smith.py](../examples/agent/smith.py) | 另一套 Graph 编排及其状态和工具配置 |
 
 项目存在两条独立实现：
 
@@ -323,7 +324,7 @@ if score < min_score:
 
 ## 10. 独立学习 Graph 的自动召回改造练习
 
-正式 `/chat` 已通过请求级业务图的 `recall` 节点实现回答前召回。下面只讨论尚未与 API 统一的独立 [graph.py](../src/agent/graph.py) 学习示例，不是正式入口的待合入方案。
+正式 `/chat` 已通过请求级业务图的 `recall` 节点实现回答前召回。下面只讨论尚未与 API 统一的独立 [graph.py](../examples/agent/graph.py) 学习示例，不是正式入口的待合入方案。
 
 独立学习 Graph 当前的顺序是：
 
@@ -381,7 +382,7 @@ config = {"configurable": {"thread_id": trusted_thread_key}}
 result = graph.invoke(input_state, config=config)
 ```
 
-把 `session_id` 放进 `input_state` 不会自动完成这一步。项目的 [test_graph.py](../src/agent/test/test_graph.py) 当前恰好遗漏了配置。[LangGraph 持久化说明](https://docs.langchain.com/oss/python/langgraph/persistence)
+把 `session_id` 放进 `input_state` 不会自动完成这一步。项目的 [memory_graph_demo.py](../examples/agent/demos/memory_graph_demo.py) 当前恰好遗漏了配置。[LangGraph 持久化说明](https://docs.langchain.com/oss/python/langgraph/persistence)
 
 <a id="offline-lab"></a>
 
@@ -547,7 +548,7 @@ PY
 | 记录缺乏来源、时间和有效状态 | 难解释、更新或排除过期事实 | 设计来源、更新时间、状态和删除机制；需迁移 Schema |
 | 独立 Graph 尚无回答前自动召回 | Graph 与主 API 的记忆行为不同 | 增加召回节点时使用临时提示或覆盖字段，避免把动态内容写进历史 |
 | 召回或保存异常可中断聊天 | 用户可能收不到已生成的回答 | 定义失败策略，记录可恢复错误；不要吞掉全部异常 |
-| 导入 tools 就加载模型并连接数据库 | 难做单元验证，也让启动依赖所有外部服务 | 按生命周期初始化或依赖注入 |
+| 导入时加载模型并连接数据库 | 本次已改为应用启动时初始化；离线脚本仍需明确入口 | 继续隔离独立演示与外部集成 |
 | 独立 Graph 的 Checkpointer 仍在内存中 | Graph 示例重启后丢失会话 | 如将它作为正式入口，另行接入持久化并修复消息 reducer；主 API 已使用 PostgreSQL |
 
 若把保存改成后台任务，应同时考虑任务失败重试、同一消息重复执行的幂等性，以及下一轮请求可能发生在保存完成之前。后台处理降低响应等待，不会自动解决数据一致性。
@@ -572,7 +573,7 @@ PY
 
 “没有召回到”和“检索服务不可用”必须分开排查。当前函数没有把数据库错误转换为结构化状态；异常并不会自动变成空结果。
 
-真实联调应使用独立测试用户和测试 Collection，并先确认启动依赖、配置及身份边界。`src/agent/update.py` 和 `scripts/milvus/create_db.py` 会删除已存在的目标 Collection，不能把它们当成无副作用的状态检查命令。
+真实联调应使用独立测试用户和测试 Collection，并先确认启动依赖、配置及身份边界。`examples/agent/update.py` 和 `scripts/milvus/create_db.py` 会删除已存在的目标 Collection，不能把它们当成无副作用的状态检查命令。
 
 <a id="learning"></a>
 

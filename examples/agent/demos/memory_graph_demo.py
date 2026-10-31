@@ -1,4 +1,4 @@
-from graph import graph
+from examples.agent.graph import graph
 
 result = graph.invoke(
     {

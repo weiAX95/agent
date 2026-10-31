@@ -134,11 +134,12 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上十组离
 - `/api/chat` 从 JWT `sub` 获取 `user_id`，路径、主题和任务接口加入了所有权检查；双用户端到端验收仍未完成。独立 Graph 示例的记忆工具仍需可信身份绑定；不能仅凭复合线程 ID 断言整个项目已完成访问控制。
 - 旧版 `InMemorySaver` 中的历史不会自动迁移到 PostgreSQL；新部署从新的 checkpoint 开始。
 - 当前 `/api/chat` 用独立连接池的 PostgreSQL session advisory lock 互斥同一会话；高并发延迟、多进程与进程退出边界仍需在真实负载下验证。checkpoint 写入与 `ChatLog` 提交使用不同连接和事务，因此日志提交失败时，checkpoint 可能已经更新；需要按业务要求补偿或重试。
-- `src/agent/graph.py` 是独立的 Graph 学习入口，尚未与 API 的会话持久化流程统一；不要把它的示例行为当作 `/api/chat` 的验收结果。
+- `examples/agent/graph.py` 是独立的 Graph 学习入口，不使用 API 的会话持久化流程；不要把它的示例行为当作 `/api/chat` 的验收结果。
 
 ## 项目文档
 
 - [文档导航](docs/index.md)：当前规范、历史记录与学习材料的入口。
+- [源码目录说明](docs/source_layout.md)：正式 Agent、长期记忆、检索工具和独立示例的位置。
 - [问题与改进 TODO](docs/TODO.md)：问题状态、验收条件和后续工作。
 - [自动召回学习文档](docs/auto_recall.md)：长期记忆读取、向量检索与 Graph 改造。
 - [聊天业务图](docs/graph.md) 与 [迁移记录](docs/chat_graph_migration.md)：正式流程的节点、失败边界和验证。
@@ -148,4 +149,4 @@ GitHub Actions 会在每次 push 和 pull request 时自动运行以上十组离
 - [反馈回归流程](docs/feedback_regression.md)：用户负反馈的审核、脱敏和版本对比。
 - [文档整理规划](docs/documentation_reorganization_plan.md)：当前文档的合并、拆分、归档及迁移顺序。
 
-主要代码入口为 [API](api/server.py)、[Agent](src/agent/main.py)、[记忆工具](src/agent/tools.py) 和 [独立 Graph 示例](src/agent/graph.py)。
+主要代码入口为 [API](api/server.py)、[主 Agent 与聊天](src/agent/main.py)、[记忆决策](src/agent/memory/decisions.py)、[记忆存储](src/agent/memory/store.py)、[检索工具](src/agent/web_tools.py) 和 [独立 Graph 示例](examples/agent/graph.py)。旧的 `src.agent.tools` 导入路径仍可使用，它仅转发到新模块。

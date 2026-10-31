@@ -1,6 +1,4 @@
 import os
-import sys
-from pathlib import Path
 
 import dotenv
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -10,11 +8,6 @@ from langchain_openai import ChatOpenAI
 # from langgraph.checkpoint.sqlite import SqliteSaver        # SQLite 持久化（生产用）
 # from langgraph.graph import StateGraph, START, END, MessagesState
 # from langgraph.prebuilt import ToolNode, tools_condition
-# 将项目根目录加入 sys.path，以便跨模块导入
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
 from src.agent.tools import fetch_webpage, search_web
 
 dotenv.load_dotenv()

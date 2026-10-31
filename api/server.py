@@ -23,7 +23,7 @@ from src.agent.checkpoint import (
     CHECKPOINT_SETUP_LOCK_ID,
     checkpoint_dsn,
 )
-from src.agent.main import build_agent, chat_stream
+from src.agent.main import build_agent, chat_stream, close_agent_resources
 
 from api.auth import get_current_user
 from api.config import settings
@@ -90,7 +90,10 @@ async def lifespan(app: FastAPI):
             await lock_pool.close()
         if pool is not None:
             await pool.close()
-        await engine.dispose()
+        try:
+            close_agent_resources()
+        finally:
+            await engine.dispose()
 
 
 app = FastAPI(lifespan=lifespan)  # 关键：lifespan必须在这里传进去，否则永远不会执行

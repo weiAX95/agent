@@ -2,14 +2,14 @@ import time
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from model import model
-from schemas import (
+from examples.agent.model import model
+from examples.agent.schemas import (
     AgentState,
     MemoryDecision,
     MemoryResolution,
 )
-from smith import agent
-from tools import (
+from examples.agent.smith import agent
+from src.agent.tools import (
     _get_memories_by_keys,
     _insert_memory,
     replace_memory,

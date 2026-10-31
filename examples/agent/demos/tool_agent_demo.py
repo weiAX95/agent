@@ -1,6 +1,6 @@
 import time
 
-from smith import agent
+from examples.agent.smith import agent
 
 start = time.time()
 

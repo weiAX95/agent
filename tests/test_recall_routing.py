@@ -1,6 +1,6 @@
 """Offline regressions for recall gating, routing, and prompt injection.
 
-Load the real routing functions without importing main.py, whose module-level
+Load the real routing functions without importing production modules, whose module-level
 initialization loads models and connects to Milvus. Only model responses and
 storage calls are replaced, so these tests exercise the actual routing logic.
 """
@@ -23,7 +23,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_routing(namespace):
-    path = ROOT / "src/agent/main.py"
     names = {
         "MemoryKey",
         "MemoryRecallDecision",
@@ -33,24 +32,29 @@ def load_routing(namespace):
         "_prepare_chat",
         "chat",
     }
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    selected = [
-        node
-        for node in tree.body
-        if (
-            isinstance(node, (ast.FunctionDef, ast.ClassDef))
-            and node.name in names
+    for path in (
+        ROOT / "src/agent/memory/decisions.py",
+        ROOT / "src/agent/memory/context.py",
+        ROOT / "src/agent/main.py",
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        selected = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                and node.name in names
+            )
+            or (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id in names
+            )
+        ]
+        exec(
+            compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"),
+            namespace,
         )
-        or (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id in names
-        )
-    ]
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
 
 
 class RecallRoutingTests(unittest.TestCase):

@@ -39,4 +39,4 @@
 - 工具框架把返回值放入主 Agent 的工具结果消息，主 Agent 据此继续回答。`query` 和工具返回值是本次通信协议；Python 变量只用于包装和暂存本次结果，不充当两个 Agent 共享的记忆。
 - [chat_workflow.py](../src/agent/chat_workflow.py) 是外围业务流程，不是第三个 Agent。它观察主 Agent 的工具调用和结果，生成给前端看的检索进度；`report_progress` 也是主 Agent 的展示工具，不是子 Agent。
 
-独立的 [graph.py](../src/agent/graph.py) 仍是学习示例，不是 `/chat` 的入口，也不共享正式 API 的 PostgreSQL checkpoint。
+独立的 [graph.py](../examples/agent/graph.py) 已移至示例目录，不是 `/api/chat` 的入口，也不共享正式 API 的 PostgreSQL checkpoint。
