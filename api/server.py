@@ -31,7 +31,7 @@ from api.base import Base
 from api.db import check_db_connection, engine, get_db
 from api.chat_storage import begin_turn, owned_session, session_execution_lock
 from api.chat_stream import ChatRequest, persisted_chat_response
-from api.routers import auth, feedback, paths, sessions, tasks, topics
+from api.routers import auth, feedback, knowledge, paths, sessions, tasks, topics
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ app.include_router(topics.router)
 app.include_router(tasks.router)
 app.include_router(auth.router)
 app.include_router(feedback.router)
+app.include_router(knowledge.router)
 app.include_router(sessions.router)
 
 

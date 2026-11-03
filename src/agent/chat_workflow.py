@@ -163,6 +163,8 @@ def build_chat_workflow(services: ChatServices):
                                             if result.get("status") == "limited":
                                                 step = "failed"
                                                 details["reason"] = "limited"
+                                            elif result.get("status") == "no_results":
+                                                details["reason"] = "no_results"
                                     except (TypeError, ValueError):
                                         pass
                                 await state["on_activity"]("research", step, details)

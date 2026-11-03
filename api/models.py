@@ -113,6 +113,35 @@ class ChatRunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class KnowledgeDocument(Base):
+    """Catalog for the shared knowledge base; Milvus stores its active chunks."""
+
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        CheckConstraint("size_bytes > 0", name="ck_knowledge_documents_size"),
+        CheckConstraint("chunk_count > 0", name="ck_knowledge_documents_chunks"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    revision: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+Index(
+    "ix_knowledge_documents_created", KnowledgeDocument.created_at.desc(),
+    KnowledgeDocument.id.desc(),
+    postgresql_where=text("deleted_at IS NULL"),
+)
+
+
 class ChatLog(Base):
     __tablename__ = "chat_logs"
 

@@ -79,6 +79,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
             summaries = {"started": "开始查找资料", "completed": "资料检索已完成", "failed": "资料检索失败"}
             if status == "failed" and isinstance(details, dict) and details.get("reason") == "limited":
                 summaries["failed"] = "检索未完成，正在整理已获得的信息"
+            if status == "completed" and isinstance(details, dict) and details.get("reason") == "no_results":
+                summaries["completed"] = "未找到可核对的资料"
             sources = details.get("sources", []) if isinstance(details, dict) else []
             event = await turn.append_event("research", status, summaries[status], sources)
             await queue.put(("agent_step", event))

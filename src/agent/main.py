@@ -5,6 +5,7 @@ from langchain.agents.middleware import ModelRequest, ToolCallLimitMiddleware, d
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from src.agent.chat_workflow import ChatServices, build_chat_workflow
 from src.agent.checkpoint import make_thread_id
+from src.agent.knowledge_store import ensure_knowledge_collection
 from src.agent.llm import get_llm
 from src.agent.memory.client import close_memory_resources, initialize_memory_resources
 from src.agent.memory.context import _prepare_chat
@@ -29,6 +30,7 @@ def conversation_prompt(request: ModelRequest) -> str:
 def build_agent(checkpointer):
     """Build the conversation agent with an application-owned checkpointer."""
     initialize_memory_resources()
+    ensure_knowledge_collection()
     initialize_memory_decisions()
     llm = get_llm()
     # 子 Agent 的入口：这里得到的是名为 research 的工具包装，不是子 Agent 的内部状态。

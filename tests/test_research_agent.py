@@ -63,10 +63,14 @@ class ResearchToolTests(unittest.IsolatedAsyncioTestCase):
             {"query": "查询资料"},
             config={"configurable": {"thread_id": "private-session"}},
         )
-        self.assertEqual(json.loads(result), {"status": "ok", "summary": "资料摘要及来源", "sources": []})
+        self.assertEqual(json.loads(result), {
+            "status": "no_results",
+            "summary": "本次未找到可核对的资料，不能确认文档或网页中的结论。",
+            "sources": [],
+        })
         self.assertEqual(worker.calls[0][0], {"messages": [{"role": "user", "content": "查询资料"}]})
         self.assertNotIn("configurable", worker.calls[0][1])
-        self.assertEqual(json.loads(tool.invoke({"query": "另一个问题"}))["summary"], "资料摘要及来源")
+        self.assertEqual(json.loads(tool.invoke({"query": "另一个问题"}))["status"], "no_results")
         self.assertEqual(worker.calls[1][0]["messages"][0]["content"], "另一个问题")
 
 

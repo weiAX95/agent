@@ -8,6 +8,7 @@
 | --- | --- |
 | 产品版本与下一步 | [产品路线](../tasks/plan.md)、[执行清单](../tasks/todo.md) |
 | 聊天、主子 Agent、执行过程 | [正式聊天业务图](graph.md) |
+| 共享知识库 RAG | [当前实现与接口](knowledge_rag_current.md)、[检索评估记录](knowledge_rag_eval.md) |
 | `src` 目录与代码入口 | [源码目录说明](source_layout.md) |
 | 会话、消息和事件表 | [当前会话数据结构](session_current.md) |
 | 长期记忆 | [当前记忆机制](memory_current.md) |
