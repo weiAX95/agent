@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "description": "云杉虚构资料 v1；预期证据在检索前固定；资料均需上传到隔离环境。",
+  "documents": [
+    {
+      "key": "handbook",
+      "path": "documents/handbook.md",
+      "sha256": "f289defc619241cdf87462fdf87b286d6ae27259864ce8b8abc63e1a67e12d87"
+    },
+    {
+      "key": "devices",
+      "path": "documents/devices.md",
+      "sha256": "6ef929e9296a09c9a1c90f2d255d6d2eb5b4559247a7a5264ad344bd64fcdec7"
+    },
+    {
+      "key": "policy_a",
+      "path": "documents/policy_a.md",
+      "sha256": "c28a306064cf1df875f382627ccccad189cc2b44743e06276d128a7c5e2ed0ee"
+    },
+    {
+      "key": "policy_b",
+      "path": "documents/policy_b.md",
+      "sha256": "dceefec6c96fadd282f09a7432a9d4326d27129042b1c4a1d1242e4900cc33ca"
+    },
+    {
+      "key": "cross_page",
+      "path": "documents/cross_page.pdf",
+      "sha256": "f8b365873da8a9526aa86fa69d1e6d9f17e14ffff9e7bfed9687c138858f6cc9"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "fact-01",
+      "category": "fact",
+      "query": "实验室工作日几点开放？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "实验室工作日开放时间为九点至十八点。"
+          }
+        ]
+      ],
+      "reference_answer": "九点至十八点。"
+    },
+    {
+      "case_id": "fact-02",
+      "category": "fact",
+      "query": "设备预约要提前多久？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "设备预约需要提前两个工作日提交。"
+          }
+        ]
+      ],
+      "reference_answer": "两个工作日。"
+    },
+    {
+      "case_id": "fact-03",
+      "category": "fact",
+      "query": "夜间发生异常应拨打哪个分机？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "夜间异常联系号码为虚构分机七三六二。"
+          }
+        ]
+      ],
+      "reference_answer": "虚构分机七三六二。"
+    },
+    {
+      "case_id": "fact-04",
+      "category": "fact",
+      "query": "耗材报销限额和凭证要求是什么？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "| 耗材 | 三百元 | 必须附采购凭证 |"
+          }
+        ]
+      ],
+      "reference_answer": "单次三百元，必须附采购凭证。"
+    },
+    {
+      "case_id": "paraphrase-01",
+      "category": "paraphrase",
+      "query": "外来参观者能独自进入吗？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "访客需要由一名正式成员全程陪同。"
+          }
+        ]
+      ],
+      "reference_answer": "不能，正式成员须全程陪同。"
+    },
+    {
+      "case_id": "paraphrase-02",
+      "category": "paraphrase",
+      "query": "一周中什么时候不能预订仪器？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "每周三下午进行仪器维护，维护期间不接受预约。"
+          }
+        ]
+      ],
+      "reference_answer": "每周三下午。"
+    },
+    {
+      "case_id": "paraphrase-03",
+      "category": "paraphrase",
+      "query": "工具用完如何交接？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "精密工具使用结束后，先断电，再清洁台面，并填写交接单。"
+          }
+        ]
+      ],
+      "reference_answer": "先断电，再清洁台面，填写交接单。"
+    },
+    {
+      "case_id": "paraphrase-04",
+      "category": "paraphrase",
+      "query": "送修路费能报多少，什么情况下可报？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "| 交通 | 八十元 | 仅限设备外送维修 |"
+          }
+        ]
+      ],
+      "reference_answer": "八十元，仅限设备外送维修。"
+    },
+    {
+      "case_id": "exact-01",
+      "category": "exact",
+      "query": "E-Q17 是什么意思，该怎么办？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "错误码 E-Q17 表示冷却液不足，处理方法是停机后补充冷却液。"
+          }
+        ]
+      ],
+      "reference_answer": "冷却液不足，停机补充。"
+    },
+    {
+      "case_id": "exact-02",
+      "category": "exact",
+      "query": "E-Q23 如何排除？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "错误码 E-Q23 表示防护罩未闭合，处理方法是闭合防护罩后重新启动。"
+          }
+        ]
+      ],
+      "reference_answer": "闭合防护罩后重启。"
+    },
+    {
+      "case_id": "exact-03",
+      "category": "exact",
+      "query": "YS-480 的额定输入电压是多少？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "型号 YS-480 的额定输入电压为二十四伏。"
+          }
+        ]
+      ],
+      "reference_answer": "二十四伏。"
+    },
+    {
+      "case_id": "exact-04",
+      "category": "exact",
+      "query": "YS-960 可以连续运行多久？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "型号 YS-960 的最大连续运行时间为四十五分钟。"
+          }
+        ]
+      ],
+      "reference_answer": "最多四十五分钟。"
+    },
+    {
+      "case_id": "cross_chunk-01",
+      "category": "cross_chunk",
+      "query": "运输温度超过三十五度时，包装和监测有哪些要求？",
+      "evidence_groups": [
+        [
+          {
+            "document": "cross_page",
+            "text": "运输温度超过三十五度时，需要使用隔热箱。",
+            "page": 1
+          }
+        ],
+        [
+          {
+            "document": "cross_page",
+            "text": "隔热箱内必须放置温度记录仪。",
+            "page": 2
+          }
+        ]
+      ],
+      "reference_answer": "隔热箱，并在箱内放置温度记录仪。"
+    },
+    {
+      "case_id": "cross_chunk-02",
+      "category": "cross_chunk",
+      "query": "液体泄漏后如何处理，恢复使用前还需要什么？",
+      "evidence_groups": [
+        [
+          {
+            "document": "handbook",
+            "text": "检测到液体泄漏时必须停止供电。"
+          }
+        ],
+        [
+          {
+            "document": "handbook",
+            "text": "恢复使用前必须取得安全员签字。"
+          }
+        ]
+      ],
+      "reference_answer": "停止供电，恢复前取得安全员签字。"
+    },
+    {
+      "case_id": "cross_chunk-03",
+      "category": "cross_chunk",
+      "query": "校准要按什么顺序使用哪些标准片？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "校准流程：先用蓝色标准片完成零点校准。"
+          }
+        ],
+        [
+          {
+            "document": "devices",
+            "text": "零点校准完成后，使用绿色标准片校验跨度。"
+          }
+        ]
+      ],
+      "reference_answer": "先蓝色片零点校准，再绿色片校验跨度。"
+    },
+    {
+      "case_id": "cross_chunk-04",
+      "category": "cross_chunk",
+      "query": "便携设备运输时，电池如何处理？",
+      "evidence_groups": [
+        [
+          {
+            "document": "devices",
+            "text": "便携设备运输前需要拆下电池。"
+          }
+        ],
+        [
+          {
+            "document": "devices",
+            "text": "运输时电池必须单独装入绝缘袋。"
+          }
+        ]
+      ],
+      "reference_answer": "拆下电池，单独装入绝缘袋。"
+    },
+    {
+      "case_id": "no_answer-01",
+      "category": "no_answer",
+      "query": "实验室负责人姓名是什么？",
+      "evidence_groups": [],
+      "reference_answer": ""
+    },
+    {
+      "case_id": "no_answer-02",
+      "category": "no_answer",
+      "query": "设备的年度采购预算是多少？",
+      "evidence_groups": [],
+      "reference_answer": ""
+    },
+    {
+      "case_id": "no_answer-03",
+      "category": "no_answer",
+      "query": "YS-480 保修期是几年？",
+      "evidence_groups": [],
+      "reference_answer": ""
+    },
+    {
+      "case_id": "no_answer-04",
+      "category": "no_answer",
+      "query": "实验室春节期间是否开放？",
+      "evidence_groups": [],
+      "reference_answer": ""
+    },
+    {
+      "case_id": "conflict-01",
+      "category": "conflict",
+      "query": "设备借用上限统一是多少天？",
+      "evidence_groups": [
+        [
+          {
+            "document": "policy_a",
+            "text": "甲组规定设备借用上限为七天。"
+          }
+        ],
+        [
+          {
+            "document": "policy_b",
+            "text": "乙组规定设备借用上限为十四天。"
+          }
+        ]
+      ],
+      "reference_answer": "甲七天，乙十四天，没有统一规则。"
+    },
+    {
+      "case_id": "conflict-02",
+      "category": "conflict",
+      "query": "实验室数据统一保留多久？",
+      "evidence_groups": [
+        [
+          {
+            "document": "policy_a",
+            "text": "甲组规定数据保留期为三十天。"
+          }
+        ],
+        [
+          {
+            "document": "policy_b",
+            "text": "乙组规定数据保留期为九十天。"
+          }
+        ]
+      ],
+      "reference_answer": "甲三十天，乙九十天，应区分组别。"
+    },
+    {
+      "case_id": "conflict-03",
+      "category": "conflict",
+      "query": "试验开始统一需要几名负责人签字？",
+      "evidence_groups": [
+        [
+          {
+            "document": "policy_a",
+            "text": "甲组规定试验开始需要一名负责人签字。"
+          }
+        ],
+        [
+          {
+            "document": "policy_b",
+            "text": "乙组规定试验开始需要两名负责人签字。"
+          }
+        ]
+      ],
+      "reference_answer": "甲一名，乙两名。"
+    },
+    {
+      "case_id": "conflict-04",
+      "category": "conflict",
+      "query": "单次采购统一审批线是多少？",
+      "evidence_groups": [
+        [
+          {
+            "document": "policy_a",
+            "text": "甲组规定单次采购审批线为五百元。"
+          }
+        ],
+        [
+          {
+            "document": "policy_b",
+            "text": "乙组规定单次采购审批线为一千元。"
+          }
+        ]
+      ],
+      "reference_answer": "甲五百元，乙一千元。"
+    }
+  ]
+}

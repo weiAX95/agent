@@ -1,0 +1,30 @@
+{
+  "environment": "isolated-local",
+  "documents": {
+    "handbook": {
+      "document_id": "填写上传后的 UUID",
+      "revision": "填写数据库当前 revision UUID",
+      "sha256": "f289defc619241cdf87462fdf87b286d6ae27259864ce8b8abc63e1a67e12d87"
+    },
+    "devices": {
+      "document_id": "填写上传后的 UUID",
+      "revision": "填写数据库当前 revision UUID",
+      "sha256": "6ef929e9296a09c9a1c90f2d255d6d2eb5b4559247a7a5264ad344bd64fcdec7"
+    },
+    "policy_a": {
+      "document_id": "填写上传后的 UUID",
+      "revision": "填写数据库当前 revision UUID",
+      "sha256": "c28a306064cf1df875f382627ccccad189cc2b44743e06276d128a7c5e2ed0ee"
+    },
+    "policy_b": {
+      "document_id": "填写上传后的 UUID",
+      "revision": "填写数据库当前 revision UUID",
+      "sha256": "dceefec6c96fadd282f09a7432a9d4326d27129042b1c4a1d1242e4900cc33ca"
+    },
+    "cross_page": {
+      "document_id": "填写上传后的 UUID",
+      "revision": "填写数据库当前 revision UUID",
+      "sha256": "f8b365873da8a9526aa86fa69d1e6d9f17e14ffff9e7bfed9687c138858f6cc9"
+    }
+  }
+}
