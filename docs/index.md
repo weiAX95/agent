@@ -13,7 +13,7 @@
 | 会话、消息和事件表 | [当前会话数据结构](session_current.md) |
 | 长期记忆 | [当前记忆机制](memory_current.md) |
 | 身份与授权 | [JWT 与项目身份边界](jwt_auth.md) |
-| 反馈与评测 | [反馈回归](feedback_regression.md)、[网关与评测路线](gateway_evaluation_roadmap.md) |
+| 反馈与评测 | [反馈回归](feedback_regression.md)、[AI 网关当前实现](ai_gateway_current.md)、[网关与评测路线](gateway_evaluation_roadmap.md) |
 | 前端聊天 | [前端当前接入说明](../../web/my-app/docs/chat_current.md) |
 
 ## 记录与学习

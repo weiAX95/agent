@@ -24,13 +24,15 @@ from src.agent.checkpoint import (
     checkpoint_dsn,
 )
 from src.agent.main import build_agent, chat_stream, close_agent_resources
+from src.agent.model_gateway import available_profiles, default_profile_name
 
 from api.auth import get_current_user
-from api.config import settings
-from api.base import Base
-from api.db import check_db_connection, engine, get_db
 from api.chat_storage import begin_turn, owned_session, session_execution_lock
 from api.chat_stream import ChatRequest, persisted_chat_response
+from api.config import settings
+from api.gateway import ChatBodyLimitMiddleware
+from api.base import Base
+from api.db import check_db_connection, engine, get_db
 from api.routers import auth, feedback, knowledge, paths, sessions, tasks, topics
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,9 @@ async def lifespan(app: FastAPI):
     if not settings.jwt_audience:
         raise RuntimeError("JWT_AUDIENCE 未配置。")
 
+    profiles = available_profiles()
+    default_profile = default_profile_name()
+
     pool = None
     lock_pool = None
     try:
@@ -57,6 +62,16 @@ async def lifespan(app: FastAPI):
                 {"lock_id": CHECKPOINT_SETUP_LOCK_ID},
             )
             await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(text(
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
+                "model_profile VARCHAR(32) NOT NULL DEFAULT 'default'"
+            ))
+            if "default" not in {item["id"] for item in profiles}:
+                await conn.execute(
+                    text("UPDATE chat_messages SET model_profile = :profile "
+                         "WHERE model_profile = 'default'"),
+                    {"profile": default_profile},
+                )
             pool = AsyncConnectionPool(
                 conninfo=checkpoint_dsn(settings.database_url),
                 min_size=1,
@@ -78,12 +93,23 @@ async def lifespan(app: FastAPI):
             conninfo=checkpoint_dsn(settings.database_url),
             min_size=0,
             max_size=10,
-            kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
+            kwargs={
+                "autocommit": True,
+                "row_factory": dict_row,
+                "prepare_threshold": 0,
+            },
             open=False,
         )
         await lock_pool.open(wait=True)
         app.state.chat_lock_pool = lock_pool
+        app.state.model_profiles = profiles
+        app.state.default_model_profile = default_profile
         app.state.agent = build_agent(checkpointer)
+        app.state.agents = {default_profile: app.state.agent}
+        for profile in profiles:
+            name = profile["id"]
+            if name != default_profile:
+                app.state.agents[name] = build_agent(checkpointer, name, initialize=False)
         yield
     finally:
         if lock_pool is not None:
@@ -97,6 +123,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)  # 关键：lifespan必须在这里传进去，否则永远不会执行
+app.add_middleware(ChatBodyLimitMiddleware)
 
 app.include_router(paths.router)
 app.include_router(topics.router)
@@ -105,6 +132,16 @@ app.include_router(auth.router)
 app.include_router(feedback.router)
 app.include_router(knowledge.router)
 app.include_router(sessions.router)
+
+
+@app.get("/api/models")
+async def list_model_profiles(
+    request: Request, current_user: dict = Depends(get_current_user),
+):
+    return {"code": 0, "data": {
+        "items": request.app.state.model_profiles,
+        "default": request.app.state.default_model_profile,
+    }, "message": "ok"}
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -122,6 +159,10 @@ async def get_chat_turn(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    profile = request.model_profile or getattr(http_request.app.state, "default_model_profile", "default")
+    agents = getattr(http_request.app.state, "agents", None)
+    if agents is not None and profile not in agents:
+        raise HTTPException(422, "模型档位不存在")
     try:
         owner = uuid.UUID(current_user["user_id"])
     except ValueError as exc:
@@ -132,16 +173,23 @@ async def get_chat_turn(
     async with session_execution_lock(
         http_request.app.state.chat_lock_pool, owner, request.session_id
     ):
-        turn = await begin_turn(db, owner, request.session_id, request.request_id, request.message)
+        turn = await begin_turn(
+            db, owner, request.session_id, request.request_id, request.message, profile
+        )
+        turn.model_profile = profile
         try:
             yield turn
         finally:
             import anyio
+
             with anyio.CancelScope(shield=True):
                 try:
                     await turn.interrupt_if_streaming()
                 except Exception:
-                    logger.exception("Could not finalize interrupted request_id=%s", request.request_id)
+                    logger.exception(
+                        "Could not finalize interrupted request_id=%s",
+                        request.request_id,
+                    )
 
 
 @app.post("/api/chat")
@@ -152,7 +200,9 @@ async def chat_api(
 ):
     # Request-scoped dependency retains the execution lock until SSE closes.
     return persisted_chat_response(
-        turn, http_request.app.state.agent, chat_stream, _usage_payload
+        turn, getattr(http_request.app.state, "agents", {}).get(
+            turn.model_profile, http_request.app.state.agent
+        ), chat_stream, _usage_payload, turn.model_profile,
     )
 
 

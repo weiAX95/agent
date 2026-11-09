@@ -85,6 +85,7 @@ class ChatMessage(Base):
     request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
+    model_profile: Mapped[str] = mapped_column(String(32), nullable=False, server_default="default")
     content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))

@@ -38,7 +38,11 @@ DATABASE_URL=postgresql+asyncpg://agent:your_password@localhost:5432/agent
 OPENAI_API_KEY=your_key
 OPENAI_BASE_URL=https://your-model-api.example/v1
 OPENAI_MODEL=your_model
+MODEL_TIMEOUT_SECONDS=60
+MODEL_MAX_RETRIES=0
 ```
+
+聊天界面的模型档位由服务端配置。需要同时接入多个 OpenAI 兼容上游时，设置 `MODEL_UPSTREAMS_JSON`、`MODEL_DEFAULT_PROFILE` 和各档位的密钥环境变量；格式与切换规则见 [AI 网关当前实现](docs/ai_gateway_current.md)。
 
 认证功能还要求以下配置。它使用 HS256，签名和验证密钥应为同一个高熵随机值；真实密钥仅放在未提交的本地配置中。
 

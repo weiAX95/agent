@@ -138,6 +138,7 @@ async def chat_session_messages(
                     "request_id": str(row.request_id),
                     "seq": row.seq,
                     "role": row.role,
+                    "model_profile": row.model_profile,
                     "content": row.content,
                     "status": row.status,
                     "error_code": row.error_code,

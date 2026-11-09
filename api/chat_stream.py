@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.responses import StreamingResponse
 
 from api.chat_storage import ChatTurn
+from src.agent.model_gateway import MODEL_ERROR_MESSAGES, classify_model_error
+from src.agent.llm import active_model_profile
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_id: uuid.UUID
     request_id: uuid.UUID
+    model_profile: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     message: str = Field(min_length=1, max_length=32000)
 
     @field_validator("message")
@@ -44,10 +47,13 @@ def terminal_event(turn: ChatTurn):
         return name, {**ids, "answer": answer, "chat_log_id": str(turn.log_id),
                       "memory_status": message.memory_status or "unknown"}
     return "error", {**ids, "code": message.error_code,
-                     "message": "上次请求未完成，请使用新请求重试；异常中断的会话需要先核对上下文"}
+                     "message": MODEL_ERROR_MESSAGES.get(
+                         message.error_code,
+                         "上次请求未完成，请使用新请求重试；异常中断的会话需要先核对上下文",
+                     )}
 
 
-def persisted_chat_response(turn, agent, chat_stream, usage_payload):
+def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profile=None):
     async def replay():
         name, payload = terminal_event(turn)
         yield encode_event(name, payload)
@@ -57,9 +63,13 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
         usage = UsageMetadataCallbackHandler()
         partial = ""
         last_saved = time.monotonic()
+        started_at = last_saved
+        first_token_at = None
 
         async def on_token(token):
-            nonlocal partial, last_saved
+            nonlocal partial, last_saved, first_token_at
+            if first_token_at is None:
+                first_token_at = time.monotonic()
             partial += token
             await queue.put(("token", {"content": token}))
             # One producer owns the DB session. Do not write on every token.
@@ -90,8 +100,15 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                                             "生成异常中断" if interrupted else "回答生成失败")
             await queue.put(("agent_step", event))
             await turn.finish("interrupted" if interrupted else "failed", content, code)
+            logger.info(
+                "chat_gateway request_id=%s status=%s code=%s duration_ms=%d first_token_ms=%s",
+                turn.request_id, "interrupted" if interrupted else "failed", code,
+                int((time.monotonic() - started_at) * 1000),
+                int((first_token_at - started_at) * 1000) if first_token_at else "missing",
+            )
 
         async def produce():
+            profile_token = active_model_profile.set(model_profile)
             try:
                 try:
                     result = await chat_stream(
@@ -110,11 +127,15 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                         "message": "生成异常中断，请使用新会话或先核对上下文。",
                     }))
                     return
-                except Exception:
-                    logger.exception("Chat generation failed; request_id=%s", turn.request_id)
-                    await record_failure("GENERATION_FAILED", partial)
+                except Exception as exc:
+                    failure = classify_model_error(exc)
+                    code, message = failure or (
+                        "GENERATION_FAILED", "生成回复失败，请使用新的 request_id 重试。"
+                    )
+                    logger.exception("Chat generation failed; request_id=%s code=%s", turn.request_id, code)
+                    await record_failure(code, partial)
                     await queue.put(("usage", usage_payload(usage)))
-                    await queue.put(("error", {"code": "GENERATION_FAILED", "message": "生成回复失败，请使用新的 request_id 重试。"}))
+                    await queue.put(("error", {"code": code, "message": message}))
                     return
 
                 if status not in {"done", "stopped"}:
@@ -137,6 +158,11 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                                       memory_status=memory_status)
                 await queue.put(("usage", usage_payload(usage)))
                 await queue.put(terminal_event(turn))
+                logger.info(
+                    "chat_gateway request_id=%s status=%s duration_ms=%d first_token_ms=%s",
+                    turn.request_id, status, int((time.monotonic() - started_at) * 1000),
+                    int((first_token_at - started_at) * 1000) if first_token_at else "missing",
+                )
             except Exception:
                 logger.exception("Saving chat result failed; request_id=%s", turn.request_id)
                 with anyio.CancelScope(shield=True):
@@ -146,6 +172,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload):
                     except Exception:
                         logger.exception("Could not mark interrupted request_id=%s", turn.request_id)
                 await queue.put(("error", {"code": "SAVE_FAILED", "message": "保存对话失败，执行结果待核对；请勿直接重复生成。"}))
+            finally:
+                active_model_profile.reset(profile_token)
 
         producer = asyncio.create_task(produce())
         try:

@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel
-from src.agent.llm import get_llm
+from src.agent.llm import active_model_profile, get_llm
 
 MemoryKey: TypeAlias = Literal[
     "career_direction",
@@ -69,11 +69,19 @@ class DeferredDecision:
     def __init__(self, schema):
         self.schema = schema
         self._chain = None
+        self._profile_chains = {}
 
     def invoke(self, prompt, config=None):
-        if self._chain is None:
-            self._chain = _memory_decision_model(self.schema)
-        return self._chain.invoke(prompt, config=config)
+        profile = active_model_profile.get()
+        if profile is None:
+            if self._chain is None:
+                self._chain = _memory_decision_model(self.schema)
+            chain = self._chain
+        else:
+            if profile not in self._profile_chains:
+                self._profile_chains[profile] = _memory_decision_model(self.schema)
+            chain = self._profile_chains[profile]
+        return chain.invoke(prompt, config=config)
 
 
 candidate_llm = DeferredDecision(MemoryCandidate)
@@ -90,6 +98,7 @@ def initialize_memory_decisions():
 def close_memory_decisions():
     for decision in (candidate_llm, resolution_llm, recall_llm):
         decision._chain = None
+        decision._profile_chains.clear()
 
 
 def route_memory_keys_with_llm(

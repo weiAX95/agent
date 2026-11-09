@@ -27,12 +27,13 @@ def conversation_prompt(request: ModelRequest) -> str:
     return request.runtime.context["system_prompt"]
 
 
-def build_agent(checkpointer):
+def build_agent(checkpointer, profile: str | None = None, initialize: bool = True):
     """Build the conversation agent with an application-owned checkpointer."""
-    initialize_memory_resources()
-    ensure_knowledge_collection()
-    initialize_memory_decisions()
-    llm = get_llm()
+    if initialize:
+        initialize_memory_resources()
+        ensure_knowledge_collection()
+        initialize_memory_decisions()
+    llm = get_llm(profile)
     # 子 Agent 的入口：这里得到的是名为 research 的工具包装，不是子 Agent 的内部状态。
     # 网页/知识库工具只交给子 Agent；主 Agent 看见的工具是 research 和 report_progress。
     research = build_research_tool(llm, tools)

@@ -205,7 +205,7 @@ class ChatTurn:
         await self.db.commit()
 
 
-async def begin_turn(db, owner, session_id, request_id, message):
+async def begin_turn(db, owner, session_id, request_id, message, model_profile="default"):
     """Reserve a pair or replay a terminal result. Must run under execution lock."""
     session = await owned_session(db, owner, session_id)
     if session.checkpoint_thread_id != make_thread_id(str(owner), str(session_id)):
@@ -222,8 +222,8 @@ async def begin_turn(db, owner, session_id, request_id, message):
         by_role = {row.role: row for row in rows}
         if set(by_role) != {"user", "assistant"}:
             raise HTTPException(409, "会话消息不完整，需要恢复后再使用")
-        if by_role["user"].content != message:
-            raise HTTPException(409, "同一 request_id 不能使用不同消息")
+        if by_role["user"].content != message or by_role["user"].model_profile != model_profile:
+            raise HTTPException(409, "同一 request_id 不能更换消息或模型档位")
         assistant = by_role["assistant"]
         if assistant.status != "streaming":
             return ChatTurn(db, session, assistant, message, replayed=True)
@@ -259,6 +259,7 @@ async def begin_turn(db, owner, session_id, request_id, message):
         request_id=request_id,
         seq=seq,
         role="user",
+        model_profile=model_profile,
         content=message,
         status="completed",
         finished_at=now,
@@ -269,6 +270,7 @@ async def begin_turn(db, owner, session_id, request_id, message):
         request_id=request_id,
         seq=seq + 1,
         role="assistant",
+        model_profile=model_profile,
         content="",
         status="streaming",
     )
