@@ -249,6 +249,8 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
         await ChatStorageTests.asyncSetUp(self)
         try:
             turn = await begin_turn(self.db, self.owner, self.session.id, uuid.uuid4(), "你好")
+            # The real request dependency attaches the selected profile before chat_api.
+            turn.model_profile = 'default'
             calls = []
             agent = object()
 
@@ -346,7 +348,7 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         row_factory = object()
 
         class FakeConnection:
-            async def execute(self, statement, params):
+            async def execute(self, statement, params=None):
                 events.append(("setup_lock", statement, params))
 
             async def run_sync(self, callback):
@@ -405,6 +407,8 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             "AsyncPostgresSaver": FakeSaver,
             "build_agent": fake_build_agent,
             "close_agent_resources": lambda: None,
+            "available_profiles": lambda: [{'id':'default'}],
+            "default_profile_name": lambda: 'default',
             "settings": SimpleNamespace(
                 database_url="postgresql+asyncpg://u:p@h/db",
                 jwt_verifying_key="test-verifying-key",

@@ -257,3 +257,6 @@ class Task(Base):
         "in_progress": {"done", "todo"},
         "done": {"in_progress"},
     }
+
+# Register additive knowledge tables with the application's shared metadata.
+from api.knowledge_models import KnowledgeAuditEvent, KnowledgeChunkRecord, KnowledgeIndexJob

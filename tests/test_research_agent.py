@@ -2,6 +2,7 @@
 
 import unittest
 import json
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,63 @@ class FakeWorker:
 
 
 class ResearchToolTests(unittest.IsolatedAsyncioTestCase):
+    def knowledge_result(self, hits, status="ok"):
+        return {"messages": [
+            SimpleNamespace(content="", tool_calls=[{"id": "knowledge", "name": "search_knowledge_base", "args": {"query": "测试"}}]),
+            SimpleNamespace(content=json.dumps({"status": status, "hits": hits}), tool_call_id="knowledge", status="success"),
+            SimpleNamespace(content="研究摘要", tool_calls=[]),
+        ]}
+
+    def knowledge_hit(self, text):
+        return {"document_id": str(uuid.uuid4()), "chunk_id": str(uuid.uuid4()),
+                "title": "虚构资料", "page": 2, "text": text}
+
+    async def test_full_evidence_preserves_tail_without_expanding_source_cards(self):
+        text = "背景说明。" * 70 + "关键条件：必须取得安全员签字。"
+        hit = self.knowledge_hit(text)
+        data = json.loads(research_result(self.knowledge_result([hit, hit])))
+        self.assertEqual(data["evidence"], [{"document_id": hit["document_id"],
+            "chunk_id": hit["chunk_id"], "title": hit["title"], "page": 2, "text": text}])
+        self.assertEqual(len(data["sources"]), 1)
+        self.assertEqual(data["sources"][0]["excerpt"], text[:300])
+        self.assertNotIn("安全员", data["sources"][0]["excerpt"])
+
+    async def test_evidence_is_bounded_and_only_contains_selected_sources(self):
+        hits = [self.knowledge_hit("中" * 1300) for _ in range(5)]
+        result = self.knowledge_result(hits)
+        # Add a second successful tool call; source and evidence budgets span calls.
+        extra = self.knowledge_result([self.knowledge_hit("额外资料")])
+        extra["messages"][0].tool_calls[0]["id"] = "extra"
+        extra["messages"][1].tool_call_id = "extra"
+        result["messages"] = result["messages"][:-1] + extra["messages"]
+        data = json.loads(research_result(result))
+        self.assertEqual(len(data["evidence"]), 5)
+        self.assertLessEqual(sum(len(e["text"].encode()) for e in data["evidence"]), 5 * 4096)
+        self.assertEqual({e["chunk_id"] for e in data["evidence"]}, {s["chunk_id"] for s in data["sources"]})
+
+    async def test_unavailable_empty_invalid_and_oversized_results_do_not_supply_evidence(self):
+        for status, hits in [
+            ("unavailable", [self.knowledge_hit("不可用")]),
+            ("no_results", [self.knowledge_hit("无命中")]),
+            ("ok", [self.knowledge_hit(" ")]),
+            ("ok", [dict(self.knowledge_hit("无效"), chunk_id="invalid")]),
+            ("ok", [self.knowledge_hit("中" * 1400)]),
+        ]:
+            with self.subTest(status=status, hits=hits):
+                data = json.loads(research_result(self.knowledge_result(hits, status)))
+                self.assertFalse(data.get("evidence"))
+                self.assertFalse(data["sources"])
+
+    async def test_sync_and_async_tools_both_deliver_full_evidence(self):
+        result = self.knowledge_result([self.knowledge_hit("前文" * 180 + "尾部条件")])
+        class KnowledgeWorker(FakeWorker):
+            def invoke(self, payload, config=None):
+                return result
+        with patch("src.agent.research_agent.create_agent", return_value=KnowledgeWorker()):
+            tool = build_research_tool(object(), [])
+        for raw in (tool.invoke({"query": "测试"}), await tool.ainvoke({"query": "测试"})):
+            self.assertTrue(json.loads(raw)["evidence"][0]["text"].endswith("尾部条件"))
+
     async def test_limit_is_scoped_to_research_and_hidden_from_user_summary(self):
         result = {"messages": [
             SimpleNamespace(content="", tool_calls=[{"id": "one", "name": "search_web", "args": {"query": "x"}}]),
