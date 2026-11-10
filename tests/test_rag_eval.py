@@ -200,3 +200,11 @@ class RagEvalTests(unittest.TestCase):
         with patch.object(rag, 'live_backend', side_effect=AssertionError('must stay offline')):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(rag.main(['validate', '--dataset', str(self.root / 'dataset.json')]), 0)
+
+    def test_expanded_page_range_matches_only_pages_inside_the_evidence_span(self):
+        case=self.case('page',[[{'document':'a','text':'第二页事实','page':2}]])
+        hit=dict(self.hit('第二页事实'),page=1,page_end=2)
+        observation={'status':'ok','hits':[hit]}
+        self.assertTrue(rag.case_scores(case,observation,self.binding)['hit'])
+        hit['page_end']=1
+        self.assertFalse(rag.case_scores(case,observation,self.binding)['hit'])

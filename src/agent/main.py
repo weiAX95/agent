@@ -56,6 +56,8 @@ def build_agent(checkpointer, profile: str | None = None, initialize: bool = Tru
 
 
 def close_agent_resources():
+    from src.agent.knowledge_database import close_knowledge_database
+    close_knowledge_database()
     close_memory_decisions()
     close_memory_resources()
     get_llm.cache_clear()

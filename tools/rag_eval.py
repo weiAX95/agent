@@ -135,7 +135,7 @@ def code_version():
         return {'commit': None, 'dirty': None}
 
 
-def run_dataset(dataset, bindings, *, search, catalog_loader, runtime):
+def run_dataset(dataset, bindings, *, search, catalog_loader, runtime, trace_reader=None):
     validate_bindings(dataset, bindings)
     verify_catalog(bindings, catalog_loader())
     observations = []
@@ -147,6 +147,10 @@ def run_dataset(dataset, bindings, *, search, catalog_loader, runtime):
             observation = {'status': 'ok', 'hits': hits[:5]}
         except Exception as exc:
             observation = {'status': 'error', 'hits': [], 'error_type': type(exc).__name__, 'error': str(exc)}
+        if trace_reader is not None:
+            trace = trace_reader()
+            if trace is not None:
+                observation['retrieval_trace'] = dict(trace)
         observations.append({'case_id': case['case_id'], **observation,
                              'latency_ms': round((time.perf_counter() - started) * 1000, 3)})
     # A changed corpus invalidates the run, rather than silently mixing revisions.
@@ -164,7 +168,9 @@ def case_scores(case, observation, bindings):
     groups = case['evidence_groups']
     covered = sum(any(
         hit.get('document_id') == bindings['documents'][evidence['document']]['document_id']
-        and (evidence.get('page') is None or hit.get('page') == evidence['page'])
+        and (evidence.get('page') is None or
+             type(hit.get('page')) is int and type(hit.get('page_end', hit['page'])) is int
+             and hit['page'] <= evidence['page'] <= hit.get('page_end', hit['page']))
         and normalize(evidence['text']) in normalize(hit.get('text', ''))
         for evidence in group for hit in hits) for group in groups)
     return {'hit': bool(covered) if groups else None,
@@ -213,6 +219,7 @@ def build_report(run, reviews=None):
         seen.add(case_id)
         require(isinstance(review.get('answer'), str), 'Review answer must be text')
         require(isinstance(review.get('notes', ''), str), 'Review notes must be text')
+        require(isinstance(review.get('reviewer', 'unspecified'), str), 'Reviewer must be text')
         for field in ('citations_valid', 'facts_supported', 'conflict_explained'):
             require(review.get(field) is None or type(review[field]) is bool, 'Review judgment must be boolean or null')
         judged = any(review.get(f) is not None for f in ('citations_valid', 'facts_supported', 'conflict_explained'))
@@ -232,6 +239,7 @@ def build_report(run, reviews=None):
             'failure_rate': (len(rows) - len(successes)) / len(rows),
             'latency_count': len(latencies), 'p50_ms': percentile(latencies, .5), 'p95_ms': percentile(latencies, .95)},
         'manual': {'status': '未评审' if not checked else '已录入答案；各项仅统计明确判断',
+            'reviewers': sorted({r.get('reviewer') or 'unspecified' for r in checked}),
             'reviewed_count': len(checked), **{
                 f'{field}_rate': mean([r[field] for r in checked if r.get(field) is not None])
                 for field in ('citations_valid', 'facts_supported', 'conflict_explained')},
@@ -278,35 +286,46 @@ def live_backend():
     from src.agent import knowledge_store as store
     from src.agent.knowledge_ingest import prepare_document
     from src.agent.memory import client as resources
+    from src.agent.knowledge_versions import embedding_version
     model_path = Path(os.path.expanduser('~/models/bge-base-zh-v1.5'))
     require(model_path.is_dir(), 'Existing local BGE model is required; no downloads performed')
     # Production get_client can create agent_memory. Fail first if it is absent.
-    client = MilvusClient(uri=os.getenv('MILVUS_URI', 'http://localhost:19530'), timeout=10)
+    client = MilvusClient(uri=os.getenv('MILVUS_URI', 'http://localhost:19530'),
+                         db_name=os.getenv('MILVUS_DB_NAME', 'default'), timeout=10)
     try:
         for name in (resources.MEMORY_COLLECTION, store.KNOWLEDGE_COLLECTION):
             require(client.has_collection(name, timeout=10), f'Required existing collection missing: {name}')
     finally:
         client.close()
     def catalog():
+        import re
+        schema = os.getenv('KNOWLEDGE_PG_SCHEMA', 'public')
+        require(bool(re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', schema)), 'Invalid PostgreSQL schema')
         with psycopg.connect(checkpoint_dsn(settings.database_url), connect_timeout=5,
-                             options='-c default_transaction_read_only=on') as conn:
+                             options=f'-c default_transaction_read_only=on -c search_path={schema}') as conn:
             with conn.cursor() as cur:
                 cur.execute('SELECT id::text, revision::text, sha256 FROM knowledge_documents WHERE deleted_at IS NULL')
                 return [dict(document_id=i, revision=r, sha256=h) for i, r, h in cur.fetchall()]
     tree = ast.parse(inspect.getsource(prepare_document))
     splitter = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'RecursiveCharacterTextSplitter')
     chunking = {k.arg: ast.literal_eval(k.value) for k in splitter.keywords}
-    runtime = {'embedding': {'model': str(model_path), 'config_sha256': {
+    runtime = {'embedding': {'model': str(model_path), 'weights_version':embedding_version(model_path), 'config_sha256': {
         p.name: sha256_file(p) for p in model_path.glob('*config*.json')}},
         'chunking': chunking, 'retrieval': {'collection': store.KNOWLEDGE_COLLECTION,
         'metric': 'COSINE', 'limit': 5, 'threshold': store._score_threshold(None),
-        'consistency': 'Strong'}}
-    return store.search_knowledge_chunks, catalog, runtime, resources.close_memory_resources
+        'consistency': 'Strong', 'mode': os.getenv('KNOWLEDGE_RETRIEVAL_MODE', 'vector'),
+        'neighbors': os.getenv('KNOWLEDGE_EXPAND_NEIGHBORS', '0')},
+        'chunking_version': os.getenv('KNOWLEDGE_CHUNKING_VERSION','2')}
+    def close_backend():
+        from src.agent.knowledge_database import close_knowledge_database
+        resources.close_memory_resources()
+        close_knowledge_database()
+    return store.search_knowledge_chunks, catalog, runtime, close_backend
 
 
 def review_template(run):
     return {'run_sha256': digest(run), 'cases': [dict(case_id=c['case_id'], answer='', citations_valid=None,
-            facts_supported=None, conflict_explained=None, notes='') for c in run['cases']]}
+            facts_supported=None, conflict_explained=None, notes='', reviewer='') for c in run['cases']]}
 
 
 def markdown_report(report):
@@ -314,6 +333,7 @@ def markdown_report(report):
         lines = ['# RAG 评测报告', '', f"运行：{report['run_id']}", '', '## 自动指标', '']
         lines += [f'- {key}: {value if value is not None else "不适用"}' for key, value in report['metrics'].items()]
         lines += ['', '## 人工评审', '', report['manual']['status'], '']
+        lines += ['审核者：' + ', '.join(report['manual'].get('reviewers', [])) + '（未指定不代表已由用户验收）', '']
         lines += [f'- {k}: {v if v is not None else "未评审"}' for k, v in report['manual'].items() if k.endswith('_rate')]
         lines += ['', '| 案例 | 状态 | Hit@5 | 覆盖率 | 无答案误召回 | 耗时 ms |', '| --- | --- | --- | --- | --- | --- |']
         lines += [f"| {r['case_id']} | {r['status']} | {r['hit']} | {r['coverage']} | {r['false_recall']} | {r['latency_ms']} |" for r in report['cases']]
@@ -355,7 +375,9 @@ def main(argv=None):
             require(not output.with_suffix('.reviews.json').exists(), 'Review template already exists')
             search, catalog, runtime, close = live_backend()
             try:
-                result = run_dataset(dataset, bindings, search=search, catalog_loader=catalog, runtime=runtime)
+                from src.agent.knowledge_store import last_retrieval
+                result = run_dataset(dataset, bindings, search=search, catalog_loader=catalog, runtime=runtime,
+                                     trace_reader=last_retrieval.get)
             finally:
                 close()
             write_json(output, result)

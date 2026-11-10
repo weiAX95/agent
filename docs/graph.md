@@ -29,14 +29,16 @@
               │ 需要查证时调用 research(query)
               ↓
           research 工具包装 → 检索子 Agent（本次独立运行）→ 网页/知识库工具
-              │ 返回 {status, summary, sources} JSON
+              │ 返回 {status, summary, sources, evidence?} JSON
               ↓
           主 Agent 收到工具结果消息 → 继续生成回答
 ```
 
 - [main.py](../src/agent/main.py) 中的 `create_agent(..., checkpointer=...)` 是主 Agent；`research` 变量是工具包装。主 Agent 只能通过该工具提交查询、读取返回值，不直接读取子 Agent 的局部变量或完整执行状态。
-- [research_agent.py](../src/agent/research_agent.py) 中的 `worker = create_agent(...)` 是检索子 Agent。它接收一个 `query`，单独运行检索，把可用结果压缩为 `status`、`summary`、`sources`，再由 `StructuredTool` 返回。它与主 Agent 使用同一个模型配置，但不共享会话历史或 checkpoint。
+- [research_agent.py](../src/agent/research_agent.py) 中的 `worker = create_agent(...)` 是检索子 Agent。它接收一个 `query`，单独运行检索，把可用结果压缩为 `status`、`summary`、`sources`，内部文档另附有界的 `evidence` 原文，再由 `StructuredTool` 返回。它与主 Agent 使用同一个模型配置，但不共享会话历史或 checkpoint。
 - 工具框架把返回值放入主 Agent 的工具结果消息，主 Agent 据此继续回答。`query` 和工具返回值是本次通信协议；Python 变量只用于包装和暂存本次结果，不充当两个 Agent 共享的记忆。
 - [chat_workflow.py](../src/agent/chat_workflow.py) 是外围业务流程，不是第三个 Agent。它观察主 Agent 的工具调用和结果，生成给前端看的检索进度；`report_progress` 也是主 Agent 的展示工具，不是子 Agent。
 
 独立的 [graph.py](../examples/agent/graph.py) 已移至示例目录，不是 `/api/chat` 的入口，也不共享正式 API 的 PostgreSQL checkpoint。
+
+2026-11-10：知识库模式缓冲正文并检查引用；可选事实核验也覆盖普通内部研究链路。核验失败时先修正 checkpoint 再发送最终正文，停止时不保存未审核草稿。配置和实测边界见 [RAG 操作说明](rag/operations.md)。

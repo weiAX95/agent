@@ -34,7 +34,8 @@ def _ensure_memory_collection(connection):
 
 @lru_cache(maxsize=1)
 def get_client():
-    connection = MilvusClient(uri=os.getenv("MILVUS_URI", "http://localhost:19530"))
+    connection = MilvusClient(uri=os.getenv("MILVUS_URI", "http://localhost:19530"),
+                              db_name=os.getenv('MILVUS_DB_NAME', 'default'))
     try:
         _ensure_memory_collection(connection)
     except Exception:
