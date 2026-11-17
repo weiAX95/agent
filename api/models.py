@@ -114,6 +114,31 @@ class ChatRunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class AgentRun(Base):
+    """持久化执行事实；消息表继续负责界面展示与原有 SSE 协议。"""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        UniqueConstraint("session_id", "request_id", name="uq_agent_runs_request"),
+        UniqueConstraint("assistant_message_id", name="uq_agent_runs_assistant"),
+        CheckConstraint("status IN ('created','running','succeeded','failed','cancelled','timed_out')", name="ck_agent_runs_status"),
+        CheckConstraint("max_steps > 0 AND steps >= 0 AND steps <= max_steps", name="ck_agent_runs_steps"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_sessions.id", ondelete="RESTRICT"), nullable=False)
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    assistant_message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_messages.id", ondelete="RESTRICT"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="created")
+    max_steps: Mapped[int] = mapped_column(Integer, nullable=False)
+    steps: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class KnowledgeDocument(Base):
     """Catalog for the shared knowledge base; Milvus stores its active chunks."""
 
