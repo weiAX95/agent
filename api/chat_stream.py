@@ -111,6 +111,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
             profile_token = active_model_profile.set(model_profile)
             try:
                 try:
+                    await turn.start_run()
                     result = await chat_stream(
                         message=turn.user_content, user_id=str(turn.owner_id),
                         session_id=str(turn.session_id), agent=agent,

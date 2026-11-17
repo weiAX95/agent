@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy import select
 
 from api.chat_stream import ChatRequest, persisted_chat_response
-from api.models import ChatLog, ChatMessage, ChatRunEvent
+from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent
 from api.routers.sessions import chat_session_messages
 from fastapi import HTTPException
 import test_chat_storage as storage_tests
@@ -44,6 +44,7 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     row = await reader.get(ChatMessage, turn.assistant_id)
                     self.assertEqual((row.status, row.content), ("completed", "完整回答"))
                     self.assertIsNotNone(await reader.get(ChatLog, turn.assistant_id))
+                    self.assertEqual((await reader.get(AgentRun, turn.run_id)).status, "succeeded")
         body = "".join(frames)
         self.assertIn("event: token", body)
         self.assertIn("event: usage", body)
@@ -137,6 +138,7 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_replay_never_calls_model_or_invents_token_usage(self):
         request_id = uuid.uuid4()
         turn = await self.begin(request_id)
+        await turn.start_run()
         await turn.finish("completed", "原回复")
         replay = await self.begin(request_id)
 

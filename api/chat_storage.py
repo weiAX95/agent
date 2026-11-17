@@ -11,7 +11,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
-from api.models import ChatLog, ChatMessage, ChatRunEvent, ChatSession
+from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent, ChatSession
+from api.run_storage import new_run, transition_run
+from src.agent.run_policy import RunLimits, RunStatus
 
 
 async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> ChatSession:
@@ -80,6 +82,7 @@ class ChatTurn:
     assistant: ChatMessage
     user_content: str
     replayed: bool = False
+    run_id: uuid.UUID | None = None
     assistant_id: uuid.UUID = field(init=False)
     session_id: uuid.UUID = field(init=False)
     owner_id: uuid.UUID = field(init=False)
@@ -100,6 +103,18 @@ class ChatTurn:
             if self.assistant.status in ("completed", "stopped")
             else None
         )
+
+    async def start_run(self):
+        """模型执行前提交 CAS；若已被其他路径启动则禁止重复调用。"""
+        if self.replayed or self.run_id is None:
+            raise ValueError("重放请求没有可启动的 Run")
+        try:
+            if not await transition_run(self.db, self.run_id, RunStatus.CREATED, RunStatus.RUNNING):
+                raise RuntimeError("Run 无法启动，需要核对持久状态")
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
 
     async def append_event(self, stage: str, status: str, summary: str, sources=None):
         if self.replayed:
@@ -159,6 +174,17 @@ class ChatTurn:
                 )
             )
             if result.rowcount:
+                if self.run_id is not None and status != "interrupted":
+                    # 消息终态与 Run 终态共用事务，竞争失败则一并回滚。
+                    target = {
+                        "completed": RunStatus.SUCCEEDED,
+                        "stopped": RunStatus.CANCELLED,
+                        "failed": RunStatus.FAILED,
+                    }[status]
+                    if not await transition_run(
+                        self.db, self.run_id, RunStatus.RUNNING, target, now
+                    ):
+                        raise RuntimeError("Run 终态冲突，消息状态已回滚")
                 await self.db.execute(
                     update(ChatSession)
                     .where(
@@ -278,6 +304,10 @@ async def begin_turn(db, owner, session_id, request_id, message, model_profile="
     if session.last_message_at is None and session.title == "新会话":
         session.title = message.strip()[:200]
     session.last_message_at = session.updated_at = now
+    run = new_run(owner, session_id, request_id, assistant.id, RunLimits(), now)
+    # 两条消息与执行事实一次提交；失败不能留下孤立的 Run。
     db.add_all([user, assistant])
+    await db.flush()
+    db.add(run)
     await db.commit()
-    return ChatTurn(db, session, assistant, message)
+    return ChatTurn(db, session, assistant, message, run_id=run.id)
