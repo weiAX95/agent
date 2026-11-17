@@ -41,3 +41,16 @@ async def transition_run(db: AsyncSession, run_id: uuid.UUID,
         .values(**values)
     )
     return result.rowcount == 1
+
+
+async def record_run_step(db: AsyncSession, run_id: uuid.UUID, expected_steps: int) -> bool:
+    """只提交当前 Run 的下一步；状态竞争或重复回调不能多记一次。"""
+    result = await db.execute(
+        update(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.status == RunStatus.RUNNING,
+            AgentRun.steps == expected_steps - 1,
+            AgentRun.max_steps >= expected_steps,
+        ).values(steps=expected_steps, updated_at=datetime.now(UTC))
+    )
+    return result.rowcount == 1

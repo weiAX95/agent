@@ -4,8 +4,10 @@ import asyncio
 import json
 import unittest
 import uuid
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from langgraph.errors import GraphRecursionError
 
 from api.chat_stream import ChatRequest, persisted_chat_response
 from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent
@@ -32,6 +34,7 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
         async def model(**kwargs):
             calls.append(kwargs)
             self.assertEqual(turn.assistant.status, "streaming")
+            await kwargs["on_step"]()
             await kwargs["on_token"]("答")
             return "done", "完整回答"
 
@@ -44,13 +47,87 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     row = await reader.get(ChatMessage, turn.assistant_id)
                     self.assertEqual((row.status, row.content), ("completed", "完整回答"))
                     self.assertIsNotNone(await reader.get(ChatLog, turn.assistant_id))
-                    self.assertEqual((await reader.get(AgentRun, turn.run_id)).status, "succeeded")
+                    run = await reader.get(AgentRun, turn.run_id)
+                    self.assertEqual((run.status, run.steps), ("succeeded", 1))
         body = "".join(frames)
         self.assertIn("event: token", body)
         self.assertIn("event: usage", body)
         self.assertIn(str(turn.assistant_id), body)
         self.assertEqual(calls[0]["user_id"], str(self.owner))
         self.assertEqual(calls[0]["session_id"], str(self.session.id))
+        self.assertEqual(calls[0]["run_controller"].limits.max_steps, 24)
+
+    async def test_expired_run_never_calls_model_and_replays_same_error(self):
+        turn = await self.begin()
+        await self.db.execute(update(AgentRun).where(AgentRun.id == turn.run_id).values(
+            deadline_at=datetime.now(UTC) - timedelta(seconds=1)
+        ))
+        await self.db.commit()
+        calls = []
+
+        async def forbidden(**kwargs):
+            calls.append(kwargs)
+            raise AssertionError("过期 Run 不得调用模型")
+
+        with self.assertLogs("api.chat_stream", level="ERROR"):
+            first = await self.body(self.response(turn, forbidden))
+        self.assertEqual(calls, [])
+        self.assertIn("RUN_DEADLINE_EXCEEDED", first)
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "timed_out")
+        replay = await self.begin(turn.request_id)
+        second = await self.body(self.response(replay, forbidden))
+        self.assertIn("RUN_DEADLINE_EXCEEDED", second)
+        self.assertIn("本轮执行已超时", second)
+
+    async def test_graph_step_limit_maps_to_failed_run(self):
+        turn = await self.begin()
+
+        async def limited(**kwargs):
+            raise GraphRecursionError("graph limit reached")
+
+        with self.assertLogs("api.chat_stream", level="ERROR"):
+            body = await self.body(self.response(turn, limited))
+        self.assertIn("RUN_STEP_LIMIT_EXCEEDED", body)
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "failed")
+
+    async def test_active_run_timeout_stops_model_and_persists_timed_out(self):
+        turn = await self.begin()
+        await self.db.execute(update(AgentRun).where(AgentRun.id == turn.run_id).values(
+            deadline_at=datetime.now(UTC) + timedelta(milliseconds=200)
+        ))
+        await self.db.commit()
+        started = asyncio.Event()
+
+        async def slow(**kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            return "done", "迟到结果"
+
+        with self.assertLogs("api.chat_stream", level="ERROR"):
+            body = await self.body(self.response(turn, slow))
+        self.assertTrue(started.is_set())
+        self.assertIn("RUN_DEADLINE_EXCEEDED", body)
+        self.assertNotIn("event: done", body)
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "timed_out")
+
+    async def test_model_suppressed_cancellation_still_cannot_finish_stopped(self):
+        turn = await self.begin()
+        await self.db.execute(update(AgentRun).where(AgentRun.id == turn.run_id).values(
+            deadline_at=datetime.now(UTC) + timedelta(milliseconds=200)
+        ))
+        await self.db.commit()
+
+        async def suppressing(**kwargs):
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return "stopped", "迟到的停止结果"
+
+        with self.assertLogs("api.chat_stream", level="ERROR"):
+            body = await self.body(self.response(turn, suppressing))
+        self.assertIn("RUN_DEADLINE_EXCEEDED", body)
+        self.assertNotIn("event: stopped", body)
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "timed_out")
 
     async def test_research_progress_precedes_final_answer_and_is_not_replayed(self):
         request_id = uuid.uuid4()

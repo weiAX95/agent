@@ -2,11 +2,15 @@
 
 import asyncio
 import unittest
+import uuid
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import START, StateGraph
 
 from src.agent.chat_workflow import ChatServices, build_chat_workflow
+from src.agent.run_policy import RunController, RunLimits
 
 
 class FakeAgent:
@@ -94,6 +98,68 @@ class ChatWorkflowTests(unittest.TestCase):
 
 
 class ChatStreamWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_graph_limit_stops_next_tool_dispatch(self):
+        effects = []
+
+        def model(_state):
+            return {"messages": [AIMessage(content="继续")]}
+
+        def tools(_state):
+            effects.append("tool")
+            return {"messages": []}
+
+        from typing import TypedDict
+
+        class InnerState(TypedDict):
+            messages: list
+
+        graph = StateGraph(InnerState)
+        graph.add_node("model", model)
+        graph.add_node("tools", tools)
+        graph.add_edge(START, "model")
+        graph.add_edge("model", "tools")
+        graph.add_edge("tools", "model")
+        agent = graph.compile()
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=3, timeout_seconds=30))
+        controller.start()
+
+        async def on_token(_token):
+            pass
+
+        async def on_step():
+            controller.record_step()
+
+        with self.assertRaises(GraphRecursionError):
+            await build_chat_workflow(make_services([])).ainvoke({
+                "message": "继续", "session_id": "s1", "user_id": "alice",
+                "agent": agent, "on_token": on_token,
+                "run_controller": controller, "on_step": on_step,
+            })
+        self.assertEqual(effects, ["tool"])
+        self.assertLessEqual(controller.steps, 3)
+
+    async def test_run_limit_reaches_inner_agent_and_counts_updates(self):
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=3, timeout_seconds=30))
+        controller.start()
+        agent = FakeAgent()
+        steps = []
+
+        async def on_token(_token):
+            pass
+
+        async def on_step():
+            steps.append(controller.record_step())
+
+        await build_chat_workflow(make_services([])).ainvoke({
+            "message": "你好", "session_id": "s1", "user_id": "alice",
+            "agent": agent, "on_token": on_token,
+            "run_controller": controller, "on_step": on_step,
+        })
+        self.assertEqual(agent.calls[0][1]["config"]["recursion_limit"], 3)
+        self.assertEqual(steps, [1])
+
     async def test_limited_research_reports_incomplete_instead_of_completed(self):
         class LimitedAgent(FakeAgent):
             async def astream(self, payload, **kwargs):

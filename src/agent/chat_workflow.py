@@ -104,6 +104,8 @@ class ChatState(TypedDict, total=False):
     callbacks: list | None
     on_token: Callable
     on_activity: Callable | None
+    run_controller: Any
+    on_step: Callable | None
     memory_cache: dict
     get_memories: Callable
     agent_input: dict
@@ -211,14 +213,17 @@ def build_chat_workflow(services: ChatServices):
         research_call_ids: set[str] = set()
         progress_call_ids: set[str] = set()
         progress_updates = 0
+        agent_config = dict(config)
+        if state.get("callbacks"):
+            agent_config["callbacks"] = state["callbacks"]
+        if state.get("run_controller") is not None:
+            # LangGraph 在调度下一个 superstep 前检查递归上限，避免多执行工具。
+            agent_config["recursion_limit"] = state["run_controller"].limits.max_steps
+            state["run_controller"].check_active()
         try:
             async for part in state["agent"].astream(
                 payload,
-                config=(
-                    {**config, "callbacks": state["callbacks"]}
-                    if state.get("callbacks")
-                    else config
-                ),
+                config=agent_config,
                 context=state["agent_context"],
                 stream_mode=["messages", "updates"],
                 version="v2",
@@ -232,6 +237,8 @@ def build_chat_workflow(services: ChatServices):
                             if not buffer_answer:
                                 await state["on_token"](token)
                 elif part["type"] == "updates":
+                    if state.get("on_step"):
+                        await state["on_step"]()
                     messages = part["data"].get("model", {}).get("messages", [])
                     if messages:
                         final_message = messages[-1]

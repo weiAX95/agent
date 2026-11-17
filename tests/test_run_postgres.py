@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.models import AgentRun, ChatMessage, ChatSession, User
-from api.run_storage import new_run, transition_run
+from api.run_storage import new_run, record_run_step, transition_run
 from src.agent.run_policy import RunLimits, RunStatus
 
 
@@ -69,6 +69,15 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await transition_run(db, run.id, RunStatus.CREATED, RunStatus.RUNNING))
             await db.commit()
 
+        async def claim_first_step():
+            async with self.sessions() as db:
+                won = await record_run_step(db, run.id, 1)
+                await db.commit()
+                return won
+
+        step_outcomes = await asyncio.gather(claim_first_step(), claim_first_step())
+        self.assertEqual(sorted(step_outcomes), [False, True])
+
         async def finish(target):
             async with self.sessions() as db:
                 won = await transition_run(db, run.id, RunStatus.RUNNING, target)
@@ -81,6 +90,7 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             stored = await db.scalar(select(AgentRun).where(AgentRun.id == run.id))
             self.assertIn(stored.status, {RunStatus.SUCCEEDED, RunStatus.CANCELLED})
+            self.assertEqual(stored.steps, 1)
             self.assertIsNotNone(stored.finished_at)
             self.assertGreater(stored.deadline_at.replace(tzinfo=UTC), datetime.now(UTC))
 

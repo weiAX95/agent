@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
 from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent, ChatSession
-from api.run_storage import new_run, transition_run
-from src.agent.run_policy import RunLimits, RunStatus
+from api.run_storage import new_run, record_run_step, transition_run
+from src.agent.run_policy import RunController, RunLimitError, RunLimits, RunStatus
 
 
 async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> ChatSession:
@@ -109,8 +109,35 @@ class ChatTurn:
         if self.replayed or self.run_id is None:
             raise ValueError("重放请求没有可启动的 Run")
         try:
+            stored = await self.db.get(AgentRun, self.run_id)
+            if stored is None:
+                raise RuntimeError("Run 持久记录不存在")
             if not await transition_run(self.db, self.run_id, RunStatus.CREATED, RunStatus.RUNNING):
                 raise RuntimeError("Run 无法启动，需要核对持久状态")
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
+        deadline = stored.deadline_at
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            raise RunLimitError("RUN_DEADLINE_EXCEEDED")
+        controller = RunController(
+            run_id=self.run_id, request_id=self.request_id, owner_id=self.owner_id,
+            limits=RunLimits(max_steps=stored.max_steps, timeout_seconds=remaining),
+        )
+        controller.start()
+        return controller
+
+    async def record_step(self, step: int):
+        """把图调度步数持久化，CAS 防止同一步在竞争或重试后重复计数。"""
+        if self.run_id is None:
+            raise RuntimeError("Run 持久记录不存在")
+        try:
+            if not await record_run_step(self.db, self.run_id, step):
+                raise RuntimeError("Run 步数冲突，需要核对执行状态")
             await self.db.commit()
         except BaseException:
             await self.db.rollback()
@@ -181,6 +208,8 @@ class ChatTurn:
                         "stopped": RunStatus.CANCELLED,
                         "failed": RunStatus.FAILED,
                     }[status]
+                    if error_code == "RUN_DEADLINE_EXCEEDED":
+                        target = RunStatus.TIMED_OUT
                     if not await transition_run(
                         self.db, self.run_id, RunStatus.RUNNING, target, now
                     ):

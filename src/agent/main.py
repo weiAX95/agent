@@ -150,6 +150,8 @@ async def chat_stream(
     on_token,
     callbacks=None,
     on_activity=None,
+    run_controller=None,
+    on_step=None,
 ) -> tuple[str, str, str]:
     result = await chat_workflow.ainvoke(
         {
@@ -160,6 +162,8 @@ async def chat_stream(
             "on_token": on_token,
             "on_activity": on_activity,
             "callbacks": callbacks,
+            "run_controller": run_controller,
+            "on_step": on_step,
         }
     )
     memory_status = (

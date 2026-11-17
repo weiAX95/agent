@@ -32,6 +32,13 @@ class RunControllerTests(unittest.TestCase):
         with self.assertRaises(RunStateError):
             self.run.start()
 
+    def test_completed_graph_step_uses_same_limit(self):
+        self.run.start()
+        self.assertEqual(self.run.record_step(), 1)
+        self.assertEqual(self.run.record_step(), 2)
+        with self.assertRaises(RunLimitError):
+            self.run.record_step()
+
     def test_step_limit_rejects_extra_work_and_is_terminal(self):
         self.run.start()
         self.run.before_step()

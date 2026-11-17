@@ -8,12 +8,14 @@ import uuid
 
 import anyio
 from langchain_core.callbacks import UsageMetadataCallbackHandler
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.responses import StreamingResponse
 
 from api.chat_storage import ChatTurn
 from src.agent.model_gateway import MODEL_ERROR_MESSAGES, classify_model_error
 from src.agent.llm import active_model_profile
+from src.agent.run_policy import RunLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +67,12 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
         last_saved = time.monotonic()
         started_at = last_saved
         first_token_at = None
+        controller = None
 
         async def on_token(token):
             nonlocal partial, last_saved, first_token_at
+            if controller is not None:
+                controller.check_active()
             if first_token_at is None:
                 first_token_at = time.monotonic()
             partial += token
@@ -78,6 +83,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
                 last_saved = time.monotonic()
 
         async def on_activity(agent_name, status, details=None):
+            if controller is not None:
+                controller.check_active()
             if agent_name == "progress" and status == "started" and isinstance(details, dict):
                 summary = details.get("summary")
                 if isinstance(summary, str) and summary.strip():
@@ -108,15 +115,27 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
             )
 
         async def produce():
+            nonlocal controller
             profile_token = active_model_profile.set(model_profile)
+            deadline_scope = None
             try:
                 try:
-                    await turn.start_run()
-                    result = await chat_stream(
-                        message=turn.user_content, user_id=str(turn.owner_id),
-                        session_id=str(turn.session_id), agent=agent,
-                        on_token=on_token, callbacks=[usage], on_activity=on_activity,
-                    )
+                    controller = await turn.start_run()
+
+                    async def on_step():
+                        # 图完成一次主 Agent 调度后记录；图自己的递归上限阻止安排下一步。
+                        step = controller.record_step()
+                        await turn.record_step(step)
+
+                    deadline_scope = asyncio.timeout(controller.limits.timeout_seconds)
+                    async with deadline_scope:
+                        result = await chat_stream(
+                            message=turn.user_content, user_id=str(turn.owner_id),
+                            session_id=str(turn.session_id), agent=agent,
+                            on_token=on_token, callbacks=[usage], on_activity=on_activity,
+                            run_controller=controller, on_step=on_step,
+                        )
+                    controller.check_active()
                     status, answer = result[:2]
                     memory_status = result[2] if len(result) > 2 else "unknown"
                 except asyncio.CancelledError:
@@ -129,10 +148,21 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
                     }))
                     return
                 except Exception as exc:
-                    failure = classify_model_error(exc)
-                    code, message = failure or (
-                        "GENERATION_FAILED", "生成回复失败，请使用新的 request_id 重试。"
-                    )
+                    if isinstance(exc, RunLimitError):
+                        code = exc.code
+                    elif isinstance(exc, GraphRecursionError):
+                        code = "RUN_STEP_LIMIT_EXCEEDED"
+                    elif isinstance(exc, TimeoutError) and deadline_scope and deadline_scope.expired():
+                        code = "RUN_DEADLINE_EXCEEDED"
+                    else:
+                        code = None
+                    if code is not None:
+                        message = MODEL_ERROR_MESSAGES[code]
+                    else:
+                        failure = classify_model_error(exc)
+                        code, message = failure or (
+                            "GENERATION_FAILED", "生成回复失败，请使用新的 request_id 重试。"
+                        )
                     logger.exception("Chat generation failed; request_id=%s code=%s", turn.request_id, code)
                     await record_failure(code, partial)
                     await queue.put(("usage", usage_payload(usage)))

@@ -15,6 +15,9 @@ MODEL_ERROR_MESSAGES = {
     "MODEL_RATE_LIMITED": "模型服务繁忙，请稍后使用新的 request_id 重试。",
     "MODEL_UNAVAILABLE": "模型服务暂不可用，请稍后使用新的 request_id 重试。",
     "MODEL_AUTH_FAILED": "模型服务配置不可用，请联系管理员。",
+    # Run 失败重放需与首次 SSE 使用相同的安全提示。
+    "RUN_STEP_LIMIT_EXCEEDED": "执行步数已达上限",
+    "RUN_DEADLINE_EXCEEDED": "本轮执行已超时",
 }
 
 

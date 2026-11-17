@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.models import AgentRun
-from api.run_storage import new_run, transition_run
+from api.run_storage import new_run, record_run_step, transition_run
 from src.agent.run_policy import RunLimits, RunStatus
 
 
@@ -46,6 +46,21 @@ class RunStorageTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             with self.assertRaises(ValueError):
                 await transition_run(db, uuid.uuid4(), RunStatus.CREATED, RunStatus.SUCCEEDED)
+
+    async def test_step_cas_never_double_counts(self):
+        run = new_run(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                      RunLimits(max_steps=2))
+        async with self.sessions() as db:
+            db.add(run)
+            await db.commit()
+            self.assertTrue(await transition_run(db, run.id, RunStatus.CREATED, RunStatus.RUNNING))
+            self.assertTrue(await record_run_step(db, run.id, 1))
+            self.assertFalse(await record_run_step(db, run.id, 1))
+            self.assertTrue(await record_run_step(db, run.id, 2))
+            self.assertFalse(await record_run_step(db, run.id, 3))
+            await db.commit()
+            await db.refresh(run)
+            self.assertEqual(run.steps, 2)
 
 
 if __name__ == "__main__":
