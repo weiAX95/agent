@@ -36,10 +36,9 @@ async def transition_run(db: AsyncSession, run_id: uuid.UUID,
     values = {"status": target, "updated_at": now}
     if target in terminals:
         values["finished_at"] = now
-    conditions = [AgentRun.id == run_id, AgentRun.status == expected]
-    if target in terminals:
-        # 待核对的未知执行结果不能被迟到的 Worker 自动覆盖为终态。
-        conditions.append(AgentRun.recovery_required.is_(False))
+    # 待核对的未知执行结果不能被迟到的 Worker 再启动或自动覆盖为终态。
+    conditions = [AgentRun.id == run_id, AgentRun.status == expected,
+                  AgentRun.recovery_required.is_(False)]
     result = await db.execute(update(AgentRun).where(*conditions).values(**values))
     return result.rowcount == 1
 
@@ -50,6 +49,7 @@ async def record_run_step(db: AsyncSession, run_id: uuid.UUID, expected_steps: i
         update(AgentRun).where(
             AgentRun.id == run_id,
             AgentRun.status == RunStatus.RUNNING,
+            AgentRun.recovery_required.is_(False),
             AgentRun.steps == expected_steps - 1,
             AgentRun.max_steps >= expected_steps,
         ).values(steps=expected_steps, updated_at=datetime.now(UTC))

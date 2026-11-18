@@ -194,6 +194,7 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored.request_id, self.request_id)
             self.assertTrue(await mark_run_recovery_required(recovered, run.id))
             await recovered.commit()
+            self.assertFalse(await record_run_step(recovered, run.id, 1))
             self.assertFalse(await transition_run(
                 recovered, run.id, RunStatus.RUNNING, RunStatus.SUCCEEDED
             ))

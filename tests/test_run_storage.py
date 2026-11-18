@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.models import AgentRun
-from api.run_storage import new_run, record_run_step, transition_run
+from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
 from src.agent.run_policy import RunLimits, RunStatus
 
 
@@ -61,6 +61,30 @@ class RunStorageTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
             await db.refresh(run)
             self.assertEqual(run.steps, 2)
+
+    async def test_recovery_flag_fences_late_start_step_and_terminal(self):
+        async with self.sessions() as db:
+            created = new_run(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                              RunLimits(max_steps=2))
+            running = new_run(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                              RunLimits(max_steps=2))
+            db.add_all([created, running])
+            await db.commit()
+            self.assertTrue(await transition_run(db, running.id,
+                                                RunStatus.CREATED, RunStatus.RUNNING))
+            await db.commit()
+            self.assertTrue(await mark_run_recovery_required(db, created.id))
+            self.assertTrue(await mark_run_recovery_required(db, running.id))
+            await db.commit()
+            self.assertFalse(await transition_run(db, created.id,
+                                                 RunStatus.CREATED, RunStatus.RUNNING))
+            self.assertFalse(await record_run_step(db, running.id, 1))
+            self.assertFalse(await transition_run(db, running.id,
+                                                 RunStatus.RUNNING, RunStatus.SUCCEEDED))
+            await db.refresh(created)
+            await db.refresh(running)
+            self.assertEqual((created.status, running.status, running.steps),
+                             (RunStatus.CREATED, RunStatus.RUNNING, 0))
 
 
 if __name__ == "__main__":
