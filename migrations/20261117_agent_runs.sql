@@ -23,4 +23,16 @@ CREATE TABLE IF NOT EXISTS public.agent_runs (
 ALTER TABLE public.agent_runs
     ADD COLUMN IF NOT EXISTS recovery_required boolean NOT NULL DEFAULT false;
 
--- 回滚：确认不再有运行中 Run 后，DROP TABLE public.agent_runs。
+-- 人工核对后只可裁决一次；记录核对人和外部证据引用，不存原始工具输出。
+CREATE TABLE IF NOT EXISTS public.agent_run_reconciliations (
+    run_id uuid PRIMARY KEY REFERENCES public.agent_runs(id) ON DELETE RESTRICT,
+    reviewer_id uuid NOT NULL REFERENCES public.users(id) ON DELETE RESTRICT,
+    checkpoint_id text,
+    external_effect_status varchar(16) NOT NULL,
+    evidence_ref varchar(2048) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_run_reconciliation_effect_status
+        CHECK (external_effect_status IN ('none','confirmed'))
+);
+
+-- 回滚：确认不再有运行中 Run 后，先删除 agent_run_reconciliations，再删除 agent_runs。

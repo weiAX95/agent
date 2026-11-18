@@ -1,6 +1,7 @@
 """真实 PostgreSQL Run 迁移与并发测试；只在一次性测试数据库中运行。"""
 
 import asyncio
+import json
 import os
 import sys
 import unittest
@@ -16,8 +17,8 @@ from fastapi import HTTPException
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from api.chat_storage import ChatTurn, begin_turn
-from api.run_recovery import inspect_run_recovery
-from api.models import AgentRun, ChatLog, ChatMessage, ChatSession, User
+from api.run_recovery import abandon_run_after_review, inspect_run_recovery
+from api.models import AgentRun, AgentRunReconciliation, ChatLog, ChatMessage, ChatSession, User
 from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
 from src.agent.checkpoint import checkpoint_dsn, make_thread_id
 from src.agent.run_policy import RunLimits, RunStatus
@@ -37,6 +38,7 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             raise ValueError("Run PostgreSQL 测试仅允许 gateway_m2_test 数据库")
         self.engine = create_async_engine(DB_URL)
         async with self.engine.begin() as connection:
+            await connection.execute(text("DROP TABLE IF EXISTS public.agent_run_reconciliations"))
             await connection.execute(text("DROP TABLE IF EXISTS public.agent_runs"))
             await connection.execute(text("DROP TABLE IF EXISTS public.side_effect_log"))
             for table in (ChatLog.__table__, ChatMessage.__table__, ChatSession.__table__, User.__table__):
@@ -69,6 +71,9 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
                 for statement in statements:
                     await connection.exec_driver_sql(statement)
             self.assertIsNotNone(await connection.scalar(text("SELECT to_regclass('public.agent_runs')")))
+            self.assertIsNotNone(await connection.scalar(text(
+                "SELECT to_regclass('public.agent_run_reconciliations')"
+            )))
             self.assertEqual(await connection.scalar(
                 select(ChatMessage.content).where(ChatMessage.id == self.legacy_message)
             ), "迁移前答案")
@@ -100,6 +105,7 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await connection.scalar(
                 select(ChatSession.next_message_seq).where(ChatSession.id == self.legacy_session)
             ), 2)
+            await connection.execute(text("DROP TABLE public.agent_run_reconciliations"))
             await connection.execute(text("DROP TABLE public.agent_runs"))
             self.assertEqual(await connection.scalar(
                 select(ChatMessage.content).where(ChatMessage.id == self.legacy_message)
@@ -324,16 +330,66 @@ asyncio.run(main())
                                  uuid.uuid4(), "不能重放工具")
             self.assertEqual(blocked.exception.status_code, 409)
             run = await recovered.scalar(select(AgentRun).where(AgentRun.session_id == crash_session))
+            run_id = run.id
             self.assertTrue(run.recovery_required)
             async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
-                snapshot = await inspect_run_recovery(recovered, saver, self.owner, run.id)
+                snapshot = await inspect_run_recovery(recovered, saver, self.owner, run_id)
             self.assertEqual(snapshot["run_status"], "running")
             self.assertEqual(snapshot["message_status"], "interrupted")
             self.assertEqual(snapshot["checkpoint_id"], checkpoint.checkpoint["id"])
             self.assertFalse(snapshot["external_effects_verified"])
+            inspection = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "tools.inspect_run",
+                "--run-id", str(run_id), "--owner-id", str(self.owner),
+                env=os.environ.copy(), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            inspection_out, inspection_err = await inspection.communicate()
+            self.assertEqual(inspection.returncode, 0, inspection_err.decode())
+            self.assertEqual(json.loads(inspection_out)["checkpoint_id"],
+                             checkpoint.checkpoint["id"])
+            self.assertNotIn(b"tool-finished", inspection_out)
             self.assertEqual(await recovered.scalar(text(
                 "SELECT count(*) FROM public.side_effect_log"
             )), 1)
+            async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
+                with self.assertRaises(HTTPException) as changed:
+                    await abandon_run_after_review(
+                        recovered, saver, self.owner, run_id, self.owner, "wrong",
+                        "confirmed", "ticket:INC-123",
+                    )
+                self.assertEqual(changed.exception.status_code, 409)
+            command = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "tools.abandon_run",
+                "--run-id", str(run_id), "--owner-id", str(self.owner),
+                "--reviewer-id", str(self.owner),
+                "--checkpoint-id", checkpoint.checkpoint["id"],
+                "--external-effect-status", "confirmed",
+                "--evidence-ref", "ticket:INC-123", "--confirm-abandon",
+                env=os.environ.copy(), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await command.communicate()
+            self.assertEqual(command.returncode, 0, err.decode())
+            outcome = json.loads(out)
+            self.assertEqual(outcome, {"run_id": str(run_id), "status": RunStatus.FAILED,
+                                       "session_reusable": False})
+            await recovered.refresh(run)
+            self.assertEqual((run.status, run.recovery_required), (RunStatus.FAILED, False))
+            audit = await recovered.get(AgentRunReconciliation, run_id)
+            self.assertEqual((audit.reviewer_id, audit.evidence_ref),
+                             (self.owner, "ticket:INC-123"))
+            async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
+                with self.assertRaises(HTTPException) as repeated:
+                    await abandon_run_after_review(
+                        recovered, saver, self.owner, run_id, self.owner,
+                        checkpoint.checkpoint["id"], "confirmed", "ticket:INC-123",
+                    )
+            self.assertEqual(repeated.exception.status_code, 409)
+            with self.assertRaises(HTTPException) as still_blocked:
+                await begin_turn(recovered, self.owner, crash_session,
+                                 uuid.uuid4(), "不能恢复旧会话")
+            self.assertEqual(still_blocked.exception.status_code, 409)
 
 
 if __name__ == "__main__":

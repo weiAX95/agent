@@ -140,6 +140,29 @@ class AgentRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AgentRunReconciliation(Base):
+    """人工裁决的不可重复审计记录；不保存原始聊天或工具输出。"""
+
+    __tablename__ = "agent_run_reconciliations"
+    __table_args__ = (
+        CheckConstraint("external_effect_status IN ('none','confirmed')",
+                        name="ck_run_reconciliation_effect_status"),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="RESTRICT"), primary_key=True,
+    )
+    reviewer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False,
+    )
+    checkpoint_id: Mapped[str | None] = mapped_column(Text)
+    external_effect_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_ref: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
 class KnowledgeDocument(Base):
     """Catalog for the shared knowledge base; Milvus stores its active chunks."""
 
