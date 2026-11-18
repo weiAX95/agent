@@ -3,6 +3,7 @@
 import unittest
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 from sqlalchemy import event, select
@@ -12,6 +13,7 @@ from api.base import Base
 from api.models import AgentRun, ChatLog, ChatMessage, ChatSession, User
 from api.chat_storage import begin_turn, create_session, owned_session
 from api.run_storage import transition_run
+from api.run_recovery import inspect_run_recovery
 from src.agent.run_policy import RunStatus
 
 
@@ -194,6 +196,34 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
             self.db, turn.run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED
         ))
         await self.db.rollback()
+
+    async def test_recovery_snapshot_is_owner_scoped_and_excludes_raw_data(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("interrupted", "敏感原文", "CHECKPOINT_RECOVERY_REQUIRED")
+
+        class Saver:
+            async def aget_tuple(self, config):
+                self.config = config
+                return SimpleNamespace(
+                    checkpoint={"id": "checkpoint-1", "channel_values": {"secret": "工具结果"}},
+                    parent_config={"configurable": {"checkpoint_id": "checkpoint-0"}},
+                    pending_writes=[("task", "channel", "原始工具输出")],
+                )
+
+        saver = Saver()
+        with self.assertRaises(HTTPException) as denied:
+            await inspect_run_recovery(self.db, saver, self.other, turn.run_id)
+        self.assertEqual(denied.exception.status_code, 404)
+        snapshot = await inspect_run_recovery(self.db, saver, self.owner, turn.run_id)
+        self.assertEqual(snapshot["checkpoint_id"], "checkpoint-1")
+        self.assertEqual(snapshot["parent_checkpoint_id"], "checkpoint-0")
+        self.assertEqual(snapshot["pending_checkpoint_writes"], 1)
+        self.assertFalse(snapshot["external_effects_verified"])
+        self.assertNotIn("敏感原文", repr(snapshot))
+        self.assertNotIn("工具结果", repr(snapshot))
+        self.assertEqual(saver.config["configurable"]["thread_id"],
+                         self.session.checkpoint_thread_id)
 
     async def test_request_cleanup_marks_run_for_recovery(self):
         turn = await self.begin()

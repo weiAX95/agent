@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from api.chat_storage import ChatTurn, begin_turn
+from api.run_recovery import inspect_run_recovery
 from api.models import AgentRun, ChatLog, ChatMessage, ChatSession, User
 from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
 from src.agent.checkpoint import checkpoint_dsn, make_thread_id
@@ -323,6 +324,12 @@ asyncio.run(main())
             self.assertEqual(blocked.exception.status_code, 409)
             run = await recovered.scalar(select(AgentRun).where(AgentRun.session_id == crash_session))
             self.assertTrue(run.recovery_required)
+            async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
+                snapshot = await inspect_run_recovery(recovered, saver, self.owner, run.id)
+            self.assertEqual(snapshot["run_status"], "running")
+            self.assertEqual(snapshot["message_status"], "interrupted")
+            self.assertEqual(snapshot["checkpoint_id"], checkpoint.checkpoint["id"])
+            self.assertFalse(snapshot["external_effects_verified"])
             self.assertEqual(await recovered.scalar(text(
                 "SELECT count(*) FROM public.side_effect_log"
             )), 1)
