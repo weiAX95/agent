@@ -265,13 +265,30 @@ asyncio.run(main())
     async def test_checkpoint_survives_worker_crash_without_replaying_tool(self):
         crash_session = uuid.uuid4()
         thread_id = make_thread_id(str(self.owner), str(crash_session))
+        external_requests = []
+
+        async def receive_effect(reader, writer):
+            request = await reader.readuntil(b"\r\n\r\n")
+            external_requests.append(request.split(b"\r\n", 1)[0])
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        # 独立 HTTP 接收端代表进程外副作用；Worker 崩溃后它保留调用记录。
+        effect_server = await asyncio.start_server(receive_effect, "127.0.0.1", 0)
+        async def close_effect_server():
+            effect_server.close()
+            await effect_server.wait_closed()
+        self.addAsyncCleanup(close_effect_server)
+        effect_port = effect_server.sockets[0].getsockname()[1]
         async with self.sessions() as db:
             db.add(ChatSession(id=crash_session, owner_id=self.owner,
                                title="checkpoint 故障", checkpoint_thread_id=thread_id))
             await db.commit()
 
         child_code = """
-import asyncio, os, uuid
+import asyncio, os, urllib.request, uuid
 from typing import TypedDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -295,6 +312,10 @@ async def main():
         await saver.setup()
         graph = StateGraph(State)
         async def side_effect(_state):
+            request = urllib.request.Request(os.environ['RUN_TEST_EFFECT_URL'],
+                                             data=b'run-effect', method='POST')
+            with urllib.request.urlopen(request, timeout=3) as response:
+                assert response.status == 200
             async with engine.begin() as conn:
                 await conn.execute(text('INSERT INTO public.side_effect_log DEFAULT VALUES'))
             return {'marker': 'tool-finished'}
@@ -311,13 +332,15 @@ async def main():
 asyncio.run(main())
 """
         env = dict(os.environ, RUN_TEST_OWNER=str(self.owner),
-                   RUN_TEST_SESSION=str(crash_session), RUN_TEST_THREAD=thread_id)
+                   RUN_TEST_SESSION=str(crash_session), RUN_TEST_THREAD=thread_id,
+                   RUN_TEST_EFFECT_URL=f"http://127.0.0.1:{effect_port}/effect")
         child = await asyncio.create_subprocess_exec(
             sys.executable, "-c", child_code, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         _out, err = await child.communicate()
         self.assertEqual(child.returncode, 23, err.decode())
+        self.assertEqual(external_requests, [b"POST /effect HTTP/1.1"])
 
         async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
             checkpoint = await saver.aget_tuple({"configurable": {"thread_id": thread_id}})
@@ -390,6 +413,7 @@ asyncio.run(main())
                 await begin_turn(recovered, self.owner, crash_session,
                                  uuid.uuid4(), "不能恢复旧会话")
             self.assertEqual(still_blocked.exception.status_code, 409)
+            self.assertEqual(external_requests, [b"POST /effect HTTP/1.1"])
 
 
 if __name__ == "__main__":
