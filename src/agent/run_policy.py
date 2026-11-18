@@ -104,7 +104,7 @@ class RunController:
         return self._steps
 
     def record_step(self) -> int:
-        """记录已完成的一次主 Agent 图调度步；上游图负责在下一步前执行递归上限。"""
+        """记录主图或子图的一次调度步；调用方在安排下一步前核对共享配额。"""
         return self.before_step()
 
     def finish(self, status: RunStatus) -> None:

@@ -7,8 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from langgraph.errors import GraphRecursionError
+from langgraph.graph import START, StateGraph
+from langchain_core.messages import AIMessage
 
-from src.agent.research_agent import build_research_tool, research_result
+from src.agent.research_agent import (
+    RunStepBudget, active_run_step_budget, build_research_tool, research_result,
+)
+from src.agent.run_policy import RunController, RunLimits
 
 
 class FakeWorker:
@@ -24,6 +29,33 @@ class FakeWorker:
 
 
 class ResearchToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bounded_research_returns_final_value_and_records_step(self):
+        from typing import TypedDict
+
+        class WorkerState(TypedDict):
+            messages: list
+
+        graph = StateGraph(WorkerState)
+        graph.add_node("model", lambda _state: {"messages": [AIMessage(content="已完成")]})
+        graph.add_edge(START, "model")
+        with patch("src.agent.research_agent.create_agent", return_value=graph.compile()):
+            tool = build_research_tool(object(), [])
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=3, timeout_seconds=30))
+        controller.start()
+        steps = []
+
+        async def on_step():
+            steps.append(controller.record_step())
+
+        token = active_run_step_budget.set(RunStepBudget(controller, on_step))
+        try:
+            result = json.loads(await tool.ainvoke({"query": "资料"}))
+        finally:
+            active_run_step_budget.reset(token)
+        self.assertEqual(result["status"], "no_results")
+        self.assertEqual(steps, [1])
+
     def knowledge_result(self, hits, status="ok"):
         return {"messages": [
             SimpleNamespace(content="", tool_calls=[{"id": "knowledge", "name": "search_knowledge_base", "args": {"query": "测试"}}]),

@@ -123,7 +123,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
                     controller = await turn.start_run()
 
                     async def on_step():
-                        # 图完成一次主 Agent 调度后记录；图自己的递归上限阻止安排下一步。
+                        # 主图和研究子图共用步数；数据库 CAS 保存每次已完成的调度。
                         step = controller.record_step()
                         await turn.record_step(step)
 
