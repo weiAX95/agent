@@ -200,6 +200,9 @@ class ChatTurn:
                     finished_at=now,
                 )
             )
+            if not result.rowcount and self.run_id is not None:
+                # 另一 Worker 已裁决该消息；本请求不能把未获胜的结果当作成功返回。
+                raise RuntimeError("消息终态已由其他 Worker 提交")
             if result.rowcount:
                 if self.run_id is not None and status != "interrupted":
                     # 消息终态与 Run 终态共用事务，竞争失败则一并回滚。

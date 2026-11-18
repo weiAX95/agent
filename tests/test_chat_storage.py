@@ -87,6 +87,19 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len((await self.db.scalars(select(ChatMessage))).all()), 2)
         self.assertEqual(len((await self.db.scalars(select(ChatLog))).all()), 1)
 
+    async def test_second_terminal_submission_is_rejected(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("completed", "获胜答案")
+        with self.assertRaisesRegex(RuntimeError, "其他 Worker"):
+            await turn.finish("stopped", "迟到的取消")
+        async with self.factory() as reader:
+            message = await reader.get(ChatMessage, turn.assistant_id)
+            run = await reader.get(AgentRun, turn.run_id)
+            self.assertEqual((message.status, message.content, run.status),
+                             ("completed", "获胜答案", "succeeded"))
+            self.assertEqual(len((await reader.scalars(select(ChatLog))).all()), 1)
+
     async def test_same_key_different_body_is_conflict(self):
         request_id = uuid.uuid4()
         turn = await self.begin(request_id)

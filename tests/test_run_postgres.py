@@ -15,8 +15,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from fastapi import HTTPException
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from api.chat_storage import begin_turn
-from api.models import AgentRun, ChatMessage, ChatSession, User
+from api.chat_storage import ChatTurn, begin_turn
+from api.models import AgentRun, ChatLog, ChatMessage, ChatSession, User
 from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
 from src.agent.checkpoint import checkpoint_dsn, make_thread_id
 from src.agent.run_policy import RunLimits, RunStatus
@@ -38,9 +38,9 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.execute(text("DROP TABLE IF EXISTS public.agent_runs"))
             await connection.execute(text("DROP TABLE IF EXISTS public.side_effect_log"))
-            for table in (ChatMessage.__table__, ChatSession.__table__, User.__table__):
+            for table in (ChatLog.__table__, ChatMessage.__table__, ChatSession.__table__, User.__table__):
                 await connection.run_sync(table.drop, checkfirst=True)
-            for table in (User.__table__, ChatSession.__table__, ChatMessage.__table__):
+            for table in (User.__table__, ChatSession.__table__, ChatMessage.__table__, ChatLog.__table__):
                 await connection.run_sync(table.create)
             # 模拟目标库已有的旧版会话与消息，再执行新增 Run 表的前向迁移。
             self.legacy_owner, self.legacy_session, self.legacy_message = (
@@ -140,6 +140,43 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored.steps, 1)
             self.assertIsNotNone(stored.finished_at)
             self.assertGreater(stored.deadline_at.replace(tzinfo=UTC), datetime.now(UTC))
+
+    async def test_chat_finish_and_cancel_commit_one_consistent_terminal(self):
+        run = new_run(self.owner, self.session_id, self.request_id, self.message_id,
+                      RunLimits(max_steps=3, timeout_seconds=30))
+        async with self.sessions() as db:
+            db.add(run)
+            await db.commit()
+            self.assertTrue(await transition_run(db, run.id, RunStatus.CREATED, RunStatus.RUNNING))
+            await db.commit()
+
+        async def finish(status, answer):
+            async with self.sessions() as db:
+                session = await db.get(ChatSession, self.session_id)
+                assistant = await db.get(ChatMessage, self.message_id)
+                turn = ChatTurn(db, session, assistant, "同一请求", run_id=run.id)
+                try:
+                    await turn.finish(status, answer)
+                    return status
+                except RuntimeError as exc:
+                    self.assertIn("其他 Worker", str(exc))
+                    return "lost"
+
+        # 两个独立连接同时提交，消息和 Run 必须由同一个获胜事务裁决。
+        outcomes = await asyncio.gather(
+            finish("completed", "正常答案"), finish("stopped", "取消答案")
+        )
+        self.assertEqual(outcomes.count("lost"), 1)
+        winner = next(value for value in outcomes if value != "lost")
+        async with self.sessions() as db:
+            message = await db.get(ChatMessage, self.message_id)
+            stored = await db.get(AgentRun, run.id)
+            logs = (await db.scalars(select(ChatLog).where(ChatLog.id == self.message_id))).all()
+            self.assertEqual(message.status, winner)
+            self.assertEqual(stored.status, {
+                "completed": RunStatus.SUCCEEDED, "stopped": RunStatus.CANCELLED,
+            }[winner])
+            self.assertEqual(len(logs), 1)
 
     async def test_worker_loss_keeps_run_and_request_unique(self):
         run = new_run(self.owner, self.session_id, self.request_id, self.message_id,
