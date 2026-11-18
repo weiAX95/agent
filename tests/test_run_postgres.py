@@ -13,11 +13,12 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from fastapi import HTTPException
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from api.chat_storage import begin_turn
 from api.models import AgentRun, ChatMessage, ChatSession, User
 from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
-from src.agent.checkpoint import make_thread_id
+from src.agent.checkpoint import checkpoint_dsn, make_thread_id
 from src.agent.run_policy import RunLimits, RunStatus
 
 
@@ -181,6 +182,79 @@ asyncio.run(main())
                 "SELECT count(*) FROM public.side_effect_log"
             ))
             self.assertEqual(side_effect_count, 1)
+
+    async def test_checkpoint_survives_worker_crash_without_replaying_tool(self):
+        crash_session = uuid.uuid4()
+        thread_id = make_thread_id(str(self.owner), str(crash_session))
+        async with self.sessions() as db:
+            db.add(ChatSession(id=crash_session, owner_id=self.owner,
+                               title="checkpoint 故障", checkpoint_thread_id=thread_id))
+            await db.commit()
+
+        child_code = """
+import asyncio, os, uuid
+from typing import TypedDict
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.graph import START, StateGraph
+from api.chat_storage import begin_turn
+from src.agent.checkpoint import checkpoint_dsn
+
+class State(TypedDict):
+    marker: str
+
+async def main():
+    url = os.environ['RUN_TEST_POSTGRES_URL']
+    engine = create_async_engine(url)
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        turn = await begin_turn(db, uuid.UUID(os.environ['RUN_TEST_OWNER']),
+                                uuid.UUID(os.environ['RUN_TEST_SESSION']),
+                                uuid.uuid4(), 'checkpoint 故障')
+        await turn.start_run()
+    async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(url)) as saver:
+        await saver.setup()
+        graph = StateGraph(State)
+        async def side_effect(_state):
+            async with engine.begin() as conn:
+                await conn.execute(text('INSERT INTO public.side_effect_log DEFAULT VALUES'))
+            return {'marker': 'tool-finished'}
+        graph.add_node('tool', side_effect)
+        graph.add_edge(START, 'tool')
+        await graph.compile(checkpointer=saver).ainvoke(
+            {'marker': 'started'},
+            config={'configurable': {'thread_id': os.environ['RUN_TEST_THREAD']}},
+        )
+    await engine.dispose()
+    # 模拟 checkpoint 已落盘、消息与 Run 终态尚未提交时 Worker 被杀死。
+    os._exit(23)
+
+asyncio.run(main())
+"""
+        env = dict(os.environ, RUN_TEST_OWNER=str(self.owner),
+                   RUN_TEST_SESSION=str(crash_session), RUN_TEST_THREAD=thread_id)
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", child_code, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await child.communicate()
+        self.assertEqual(child.returncode, 23, err.decode())
+
+        async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn(DB_URL)) as saver:
+            checkpoint = await saver.aget_tuple({"configurable": {"thread_id": thread_id}})
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(checkpoint.checkpoint["channel_values"]["marker"], "tool-finished")
+
+        async with self.sessions() as recovered:
+            with self.assertRaises(HTTPException) as blocked:
+                await begin_turn(recovered, self.owner, crash_session,
+                                 uuid.uuid4(), "不能重放工具")
+            self.assertEqual(blocked.exception.status_code, 409)
+            run = await recovered.scalar(select(AgentRun).where(AgentRun.session_id == crash_session))
+            self.assertTrue(run.recovery_required)
+            self.assertEqual(await recovered.scalar(text(
+                "SELECT count(*) FROM public.side_effect_log"
+            )), 1)
 
 
 if __name__ == "__main__":
