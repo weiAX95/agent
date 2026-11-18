@@ -3,14 +3,18 @@
 import unittest
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.base import Base
-from api.models import ChatLog, ChatMessage, ChatSession, User
+from api.models import AgentRun, ChatLog, ChatMessage, ChatSession, User
 from api.chat_storage import begin_turn, create_session, owned_session
+from api.run_storage import transition_run
+from api.run_recovery import inspect_run_recovery
+from src.agent.run_policy import RunStatus
 
 
 class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
@@ -64,7 +68,11 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
         async with self.factory() as reader:
             rows = (await reader.scalars(select(ChatMessage).order_by(ChatMessage.seq))).all()
             self.assertEqual([(m.role, m.status, m.seq) for m in rows], [("user", "completed", 1), ("assistant", "streaming", 2)])
+            run = await reader.get(AgentRun, turn.run_id)
+            self.assertEqual((run.status, run.assistant_message_id), ("created", turn.assistant_id))
+        await turn.start_run()
         await turn.finish("completed", "完整回复")
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "succeeded")
         second = await self.begin(message="继续")
         self.assertEqual(second.assistant.seq, 4)
         self.assertEqual(self.session.next_message_seq, 5)
@@ -72,6 +80,7 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_replay_does_not_add_messages_or_chatlog(self):
         request_id = uuid.uuid4()
         turn = await self.begin(request_id)
+        await turn.start_run()
         log_id = await turn.finish("completed", "回复")
         replay = await self.begin(request_id)
         self.assertTrue(replay.replayed)
@@ -80,9 +89,23 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len((await self.db.scalars(select(ChatMessage))).all()), 2)
         self.assertEqual(len((await self.db.scalars(select(ChatLog))).all()), 1)
 
+    async def test_second_terminal_submission_is_rejected(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("completed", "获胜答案")
+        with self.assertRaisesRegex(RuntimeError, "其他 Worker"):
+            await turn.finish("stopped", "迟到的取消")
+        async with self.factory() as reader:
+            message = await reader.get(ChatMessage, turn.assistant_id)
+            run = await reader.get(AgentRun, turn.run_id)
+            self.assertEqual((message.status, message.content, run.status),
+                             ("completed", "获胜答案", "succeeded"))
+            self.assertEqual(len((await reader.scalars(select(ChatLog))).all()), 1)
+
     async def test_same_key_different_body_is_conflict(self):
         request_id = uuid.uuid4()
         turn = await self.begin(request_id)
+        await turn.start_run()
         await turn.finish("completed", "回复")
         with self.assertRaises(HTTPException) as error:
             await self.begin(request_id, "不同问题")
@@ -91,6 +114,7 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_turn_keeps_messages_without_success_log_and_replays_failure(self):
         request_id = uuid.uuid4()
         turn = await self.begin(request_id)
+        await turn.start_run()
         await turn.finish("failed", "部分回复", "GENERATION_FAILED")
         replay = await self.begin(request_id)
         self.assertTrue(replay.replayed)
@@ -102,6 +126,7 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stopped_reply_is_saved_without_marker_in_message(self):
         turn = await self.begin()
+        await turn.start_run()
         log_id = await turn.finish("stopped", "部分回复")
         self.assertEqual(turn.assistant.content, "部分回复")
         self.assertEqual(turn.assistant.status, "stopped")
@@ -109,12 +134,16 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_orphan_stream_is_interrupted_and_blocks_blind_reexecution(self):
         turn = await self.begin()
+        await turn.start_run()
         with self.assertRaises(HTTPException) as error:
             await self.begin(message="不能盲目重跑")
         self.assertEqual(error.exception.status_code, 409)
         await self.db.refresh(turn.assistant)
         self.assertEqual(turn.assistant.status, "interrupted")
         self.assertEqual(turn.assistant.error_code, "CHECKPOINT_RECOVERY_REQUIRED")
+        # 未确认的执行保留 running，后续恢复流程才有权裁决终态。
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
         with self.assertRaises(HTTPException):
             await self.begin(message="仍然阻止")
 
@@ -127,6 +156,7 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_finish_failure_rolls_back_message_and_legacy_log_together(self):
         turn = await self.begin()
+        await turn.start_run()
         commit = self.db.commit
 
         async def fail_commit():
@@ -140,6 +170,69 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
         rows = (await self.db.scalars(select(ChatMessage).where(ChatMessage.role == "assistant"))).all()
         self.assertEqual(rows[0].status, "streaming")
         self.assertEqual((await self.db.scalars(select(ChatLog))).all(), [])
+        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "running")
+
+    async def test_run_terminal_conflict_rolls_back_message(self):
+        turn = await self.begin()
+        await turn.start_run()
+        self.assertTrue(await transition_run(
+            self.db, turn.run_id, RunStatus.RUNNING, RunStatus.CANCELLED
+        ))
+        await self.db.commit()
+        with self.assertRaisesRegex(RuntimeError, "Run 终态冲突"):
+            await turn.finish("completed", "不能覆盖")
+        async with self.factory() as reader:
+            self.assertEqual((await reader.get(ChatMessage, turn.assistant_id)).status, "streaming")
+            self.assertEqual((await reader.get(AgentRun, turn.run_id)).status, "cancelled")
+            self.assertEqual((await reader.scalars(select(ChatLog))).all(), [])
+
+    async def test_interrupted_run_requires_reconciliation(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("interrupted", "部分回复", "CHECKPOINT_RECOVERY_REQUIRED")
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
+        self.assertFalse(await transition_run(
+            self.db, turn.run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED
+        ))
+        await self.db.rollback()
+
+    async def test_recovery_snapshot_is_owner_scoped_and_excludes_raw_data(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("interrupted", "敏感原文", "CHECKPOINT_RECOVERY_REQUIRED")
+
+        class Saver:
+            async def aget_tuple(self, config):
+                self.config = config
+                return SimpleNamespace(
+                    checkpoint={"id": "checkpoint-1", "channel_values": {"secret": "工具结果"}},
+                    parent_config={"configurable": {"checkpoint_id": "checkpoint-0"}},
+                    pending_writes=[("task", "channel", "原始工具输出")],
+                )
+
+        saver = Saver()
+        with self.assertRaises(HTTPException) as denied:
+            await inspect_run_recovery(self.db, saver, self.other, turn.run_id)
+        self.assertEqual(denied.exception.status_code, 404)
+        snapshot = await inspect_run_recovery(self.db, saver, self.owner, turn.run_id)
+        self.assertEqual(snapshot["checkpoint_id"], "checkpoint-1")
+        self.assertEqual(snapshot["parent_checkpoint_id"], "checkpoint-0")
+        self.assertEqual(snapshot["pending_checkpoint_writes"], 1)
+        self.assertFalse(snapshot["external_effects_verified"])
+        self.assertNotIn("敏感原文", repr(snapshot))
+        self.assertNotIn("工具结果", repr(snapshot))
+        self.assertEqual(saver.config["configurable"]["thread_id"],
+                         self.session.checkpoint_thread_id)
+
+    async def test_request_cleanup_marks_run_for_recovery(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.interrupt_if_streaming()
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
+        self.assertEqual((await self.db.get(ChatMessage, turn.assistant_id)).status,
+                         "interrupted")
 
 
 if __name__ == "__main__":

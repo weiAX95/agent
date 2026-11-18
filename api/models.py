@@ -1,9 +1,10 @@
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey,
-    Index, Integer, JSON, String, Text, UniqueConstraint, text,
+    Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -111,6 +112,129 @@ class ChatRunEvent(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     summary: Mapped[str] = mapped_column(String(240), nullable=False)
     sources: Mapped[list] = mapped_column(JSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AgentRun(Base):
+    """持久化执行事实；消息表继续负责界面展示与原有 SSE 协议。"""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        UniqueConstraint("session_id", "request_id", name="uq_agent_runs_request"),
+        UniqueConstraint("assistant_message_id", name="uq_agent_runs_assistant"),
+        CheckConstraint("status IN ('created','running','succeeded','failed','cancelled','timed_out')", name="ck_agent_runs_status"),
+        CheckConstraint("max_steps > 0 AND steps >= 0 AND steps <= max_steps", name="ck_agent_runs_steps"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_sessions.id", ondelete="RESTRICT"), nullable=False)
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    assistant_message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_messages.id", ondelete="RESTRICT"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="created")
+    max_steps: Mapped[int] = mapped_column(Integer, nullable=False)
+    steps: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    recovery_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentRunReconciliation(Base):
+    """人工裁决的不可重复审计记录；不保存原始聊天或工具输出。"""
+
+    __tablename__ = "agent_run_reconciliations"
+    __table_args__ = (
+        CheckConstraint("external_effect_status IN ('none','confirmed')",
+                        name="ck_run_reconciliation_effect_status"),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="RESTRICT"), primary_key=True,
+    )
+    reviewer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False,
+    )
+    checkpoint_id: Mapped[str | None] = mapped_column(Text)
+    external_effect_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_ref: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class GatewayPriceVersion(Base):
+    """按版本保存模型费率；历史事件始终引用原价目表。"""
+
+    __tablename__ = "gateway_price_versions"
+    __table_args__ = (
+        CheckConstraint("input_per_million >= 0 AND output_per_million >= 0 AND cached_input_per_million >= 0",
+                        name="ck_gateway_price_nonnegative"),
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    input_per_million: Mapped[Decimal] = mapped_column(Numeric(24, 6), nullable=False)
+    output_per_million: Mapped[Decimal] = mapped_column(Numeric(24, 6), nullable=False)
+    cached_input_per_million: Mapped[Decimal] = mapped_column(Numeric(24, 6), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class GatewayModelCall(Base):
+    """每次物理上游尝试独占一个 call_id；重试必须新建一行。"""
+
+    __tablename__ = "gateway_model_calls"
+    __table_args__ = (
+        CheckConstraint("status IN ('started','succeeded','failed','cancelled','timed_out','unknown')",
+                        name="ck_gateway_call_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="started")
+    trace_id: Mapped[str | None] = mapped_column(String(128))
+    upstream_request_id: Mapped[str | None] = mapped_column(String(128))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GatewayUsageEvent(Base):
+    """只插入的供应商用量回执；缺失用量与费用保持 NULL。"""
+
+    __tablename__ = "gateway_usage_events"
+    __table_args__ = (
+        UniqueConstraint("call_id", "event_key", name="uq_gateway_usage_receipt"),
+        CheckConstraint("status IN ('succeeded','failed','cancelled','timed_out','unknown')",
+                        name="ck_gateway_usage_status"),
+        CheckConstraint("input_tokens IS NULL OR input_tokens >= 0", name="ck_gateway_input_tokens"),
+        CheckConstraint("output_tokens IS NULL OR output_tokens >= 0", name="ck_gateway_output_tokens"),
+        CheckConstraint("cached_input_tokens IS NULL OR cached_input_tokens >= 0",
+                        name="ck_gateway_cached_tokens"),
+        CheckConstraint("input_tokens IS NULL OR cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens",
+                        name="ck_gateway_cached_within_input"),
+        CheckConstraint("cost IS NULL OR (cost >= 0 AND price_version_id IS NOT NULL)",
+                        name="ck_gateway_cost_price"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    call_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("gateway_model_calls.id", ondelete="RESTRICT"), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    price_version_id: Mapped[str | None] = mapped_column(ForeignKey("gateway_price_versions.id", ondelete="RESTRICT"))
+    currency: Mapped[str | None] = mapped_column(String(3))
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 

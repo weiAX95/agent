@@ -1,7 +1,7 @@
 """Agent Runtime 单次执行的领域约束，不直接访问数据库或模型服务。
 
-本模块是 Run Controller 的第一阶段契约，只能在进程内约束一次执行。
-持久化状态、跨 Worker 协调以及实际 Graph 接入将在后续阶段完成。
+领域状态机只在进程内约束一次执行；持久状态由 api.run_storage 的 CAS 裁决。
+主 Agent 图的调度步通过 LangGraph 递归上限和完成回调共同约束。
 """
 
 from __future__ import annotations
@@ -102,6 +102,10 @@ class RunController:
             raise RunLimitError("RUN_STEP_LIMIT_EXCEEDED")
         self._steps += 1
         return self._steps
+
+    def record_step(self) -> int:
+        """记录主图或子图的一次调度步；调用方在安排下一步前核对共享配额。"""
+        return self.before_step()
 
     def finish(self, status: RunStatus) -> None:
         """只接受一次终态转换，禁止将未确认的结果重复标记为完成。"""

@@ -11,7 +11,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
-from api.models import ChatLog, ChatMessage, ChatRunEvent, ChatSession
+from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent, ChatSession
+from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
+from src.agent.run_policy import RunController, RunLimitError, RunLimits, RunStatus
 
 
 async def create_session(db: AsyncSession, owner: uuid.UUID, title: str) -> ChatSession:
@@ -80,6 +82,7 @@ class ChatTurn:
     assistant: ChatMessage
     user_content: str
     replayed: bool = False
+    run_id: uuid.UUID | None = None
     assistant_id: uuid.UUID = field(init=False)
     session_id: uuid.UUID = field(init=False)
     owner_id: uuid.UUID = field(init=False)
@@ -100,6 +103,45 @@ class ChatTurn:
             if self.assistant.status in ("completed", "stopped")
             else None
         )
+
+    async def start_run(self):
+        """模型执行前提交 CAS；若已被其他路径启动则禁止重复调用。"""
+        if self.replayed or self.run_id is None:
+            raise ValueError("重放请求没有可启动的 Run")
+        try:
+            stored = await self.db.get(AgentRun, self.run_id)
+            if stored is None:
+                raise RuntimeError("Run 持久记录不存在")
+            if not await transition_run(self.db, self.run_id, RunStatus.CREATED, RunStatus.RUNNING):
+                raise RuntimeError("Run 无法启动，需要核对持久状态")
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
+        deadline = stored.deadline_at
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            raise RunLimitError("RUN_DEADLINE_EXCEEDED")
+        controller = RunController(
+            run_id=self.run_id, request_id=self.request_id, owner_id=self.owner_id,
+            limits=RunLimits(max_steps=stored.max_steps, timeout_seconds=remaining),
+        )
+        controller.start()
+        return controller
+
+    async def record_step(self, step: int):
+        """把图调度步数持久化，CAS 防止同一步在竞争或重试后重复计数。"""
+        if self.run_id is None:
+            raise RuntimeError("Run 持久记录不存在")
+        try:
+            if not await record_run_step(self.db, self.run_id, step):
+                raise RuntimeError("Run 步数冲突，需要核对执行状态")
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
 
     async def append_event(self, stage: str, status: str, summary: str, sources=None):
         if self.replayed:
@@ -158,7 +200,26 @@ class ChatTurn:
                     finished_at=now,
                 )
             )
+            if not result.rowcount and self.run_id is not None:
+                # 另一 Worker 已裁决该消息；本请求不能把未获胜的结果当作成功返回。
+                raise RuntimeError("消息终态已由其他 Worker 提交")
             if result.rowcount:
+                if self.run_id is not None and status != "interrupted":
+                    # 消息终态与 Run 终态共用事务，竞争失败则一并回滚。
+                    target = {
+                        "completed": RunStatus.SUCCEEDED,
+                        "stopped": RunStatus.CANCELLED,
+                        "failed": RunStatus.FAILED,
+                    }[status]
+                    if error_code == "RUN_DEADLINE_EXCEEDED":
+                        target = RunStatus.TIMED_OUT
+                    if not await transition_run(
+                        self.db, self.run_id, RunStatus.RUNNING, target, now
+                    ):
+                        raise RuntimeError("Run 终态冲突，消息状态已回滚")
+                elif self.run_id is not None and status == "interrupted":
+                    if not await mark_run_recovery_required(self.db, self.run_id):
+                        raise RuntimeError("Run 恢复标志冲突，消息状态已回滚")
                 await self.db.execute(
                     update(ChatSession)
                     .where(
@@ -189,7 +250,7 @@ class ChatTurn:
 
     async def interrupt_if_streaming(self):
         await self.db.rollback()
-        await self.db.execute(
+        result = await self.db.execute(
             update(ChatMessage)
             .where(
                 ChatMessage.id == self.assistant_id,
@@ -202,6 +263,10 @@ class ChatTurn:
                 finished_at=datetime.now(UTC),
             )
         )
+        if result.rowcount and self.run_id is not None:
+            if not await mark_run_recovery_required(self.db, self.run_id):
+                await self.db.rollback()
+                raise RuntimeError("Run 恢复标志冲突，消息状态已回滚")
         await self.db.commit()
 
 
@@ -248,6 +313,12 @@ async def begin_turn(db, owner, session_id, request_id, message, model_profile="
             stale.status = "interrupted"
             stale.error_code = "CHECKPOINT_RECOVERY_REQUIRED"
             stale.finished_at = stale.updated_at = datetime.now(UTC)
+            run_id = await db.scalar(select(AgentRun.id).where(
+                AgentRun.assistant_message_id == stale.id
+            ))
+            if run_id is not None and not await mark_run_recovery_required(db, run_id):
+                await db.rollback()
+                raise HTTPException(409, "Run 状态冲突，需要人工核对")
             await db.commit()
         raise HTTPException(409, "上次执行异常中断，需要核对上下文；请使用新会话")
 
@@ -278,6 +349,10 @@ async def begin_turn(db, owner, session_id, request_id, message, model_profile="
     if session.last_message_at is None and session.title == "新会话":
         session.title = message.strip()[:200]
     session.last_message_at = session.updated_at = now
+    run = new_run(owner, session_id, request_id, assistant.id, RunLimits(), now)
+    # 两条消息与执行事实一次提交；失败不能留下孤立的 Run。
     db.add_all([user, assistant])
+    await db.flush()
+    db.add(run)
     await db.commit()
-    return ChatTurn(db, session, assistant, message)
+    return ChatTurn(db, session, assistant, message, run_id=run.id)

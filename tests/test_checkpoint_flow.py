@@ -339,7 +339,8 @@ class TokenUsagePayloadTests(unittest.TestCase):
 
 
 class LifespanTests(unittest.IsolatedAsyncioTestCase):
-    def build_fixture(self, *, setup_fails=False, lock_pool_open_fails=False):
+    def build_fixture(self, *, setup_fails=False, lock_pool_open_fails=False,
+                      missing_run_schema=False):
         from src.agent.checkpoint import CHECKPOINT_SETUP_LOCK_ID
 
         events = []
@@ -351,8 +352,12 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             async def execute(self, statement, params=None):
                 events.append(("setup_lock", statement, params))
 
-            async def run_sync(self, callback):
-                events.append(("create_tables", callback))
+            async def run_sync(self, callback, **kwargs):
+                events.append(("create_tables", callback, kwargs))
+
+            async def scalar(self, statement):
+                events.append(("check_run_schema", statement))
+                return None if missing_run_schema else "agent_runs"
 
         class FakeEngine:
             def begin(self):
@@ -402,7 +407,11 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
 
         namespace = {
             "engine": FakeEngine(),
-            "Base": SimpleNamespace(metadata=SimpleNamespace(create_all=object())),
+            "Base": SimpleNamespace(metadata=SimpleNamespace(
+                create_all=object(),
+                sorted_tables=[SimpleNamespace(name="chat_messages"),
+                               SimpleNamespace(name="agent_runs")],
+            )),
             "AsyncConnectionPool": FakePool,
             "AsyncPostgresSaver": FakeSaver,
             "build_agent": fake_build_agent,
@@ -444,6 +453,9 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLess(event_names.index("engine_begin"), event_names.index("setup_lock"))
         self.assertLess(event_names.index("setup_lock"), event_names.index("create_tables"))
+        create_tables = next(item for item in events if isinstance(item, tuple) and item[0] == "create_tables")
+        self.assertEqual([table.name for table in create_tables[2]["tables"]], ["chat_messages"])
+        self.assertLess(event_names.index("create_tables"), event_names.index("check_run_schema"))
         self.assertLess(event_names.index("create_tables"), event_names.index("pool_open"))
         self.assertLess(event_names.index("saver_setup"), event_names.index("engine_end"))
         self.assertLess(event_names.index("engine_end"), event_names.index("build_agent"))
@@ -454,6 +466,14 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("pool_open"), events.index("saver_setup"))
         self.assertLess(events.index("saver_setup"), events.index("build_agent"))
         self.assertLess(events.index("build_agent"), events.index("pool_close"))
+        self.assertEqual(events[-1], "engine_dispose")
+
+    async def test_missing_run_migration_prevents_startup(self):
+        manager, app, events, *_ = self.build_fixture(missing_run_schema=True)
+        with self.assertRaisesRegex(RuntimeError, "20261117_agent_runs.sql"):
+            async with manager:
+                pass
+        self.assertNotIn("pool_create", events)
         self.assertEqual(events[-1], "engine_dispose")
 
     async def test_lock_pool_open_failure_closes_both_pools(self):

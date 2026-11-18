@@ -2,11 +2,17 @@
 
 import asyncio
 import unittest
+import uuid
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import START, StateGraph
 
 from src.agent.chat_workflow import ChatServices, build_chat_workflow
+from src.agent.run_policy import RunController, RunLimitError, RunLimits
+from src.agent.research_agent import build_research_tool
 
 
 class FakeAgent:
@@ -94,6 +100,188 @@ class ChatWorkflowTests(unittest.TestCase):
 
 
 class ChatStreamWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_research_step_persistence_failure_escapes_tool_error_message(self):
+        from typing import TypedDict
+
+        class InnerState(TypedDict):
+            messages: list
+
+        worker = StateGraph(InnerState)
+        worker.add_node("model", lambda _state: {"messages": [AIMessage(content="资料")]})
+        worker.add_edge(START, "model")
+        with patch("src.agent.research_agent.create_agent", return_value=worker.compile()):
+            research = build_research_tool(object(), [])
+
+        def parent_model(_state):
+            return {"messages": [AIMessage(content="", tool_calls=[{
+                "id": "research-1", "name": "research", "args": {"query": "资料"},
+            }])]}
+
+        async def parent_tools(_state):
+            try:
+                await research.ainvoke({"query": "资料"})
+            except RuntimeError:
+                # 模拟 LangGraph ToolNode 将工具错误转为消息，Run 仍必须失败。
+                return {"messages": [ToolMessage(content="tool error", tool_call_id="research-1")]}
+            self.fail("研究步的数据库失败未传出")
+
+        parent = StateGraph(InnerState)
+        parent.add_node("model", parent_model)
+        parent.add_node("tools", parent_tools)
+        parent.add_edge(START, "model")
+        parent.add_edge("model", "tools")
+        parent.add_edge("tools", "model")
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=5, timeout_seconds=30))
+        controller.start()
+        persisted_steps = []
+
+        async def on_step():
+            if controller.steps == 2:
+                raise RuntimeError("Run 步数 CAS 写入失败")
+            persisted_steps.append(controller.record_step())
+
+        async def on_token(_token):
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "CAS 写入失败"):
+            await build_chat_workflow(make_services([])).ainvoke({
+                "message": "查资料", "session_id": "s1", "user_id": "alice",
+                "agent": parent.compile(), "on_token": on_token,
+                "run_controller": controller, "on_step": on_step,
+            })
+        self.assertEqual(persisted_steps, [1, 2])
+
+    async def test_research_subgraph_shares_run_budget_before_tool_effect(self):
+        effects = []
+        parent_calls = []
+
+        from typing import TypedDict
+
+        class InnerState(TypedDict):
+            messages: list
+
+        def research_model(_state):
+            return {"messages": [AIMessage(content="检索前", tool_calls=[{
+                "id": "search-1", "name": "search_web", "args": {"query": "资料"},
+            }])]}
+
+        def search(_state):
+            effects.append("external-search")
+            return {"messages": []}
+
+        worker_graph = StateGraph(InnerState)
+        worker_graph.add_node("model", research_model)
+        worker_graph.add_node("tools", search)
+        worker_graph.add_edge(START, "model")
+        worker_graph.add_edge("model", "tools")
+        worker_graph.add_edge("tools", "model")
+        with patch("src.agent.research_agent.create_agent", return_value=worker_graph.compile()):
+            research = build_research_tool(object(), [])
+
+        def parent_model(_state):
+            parent_calls.append("model")
+            return {"messages": [AIMessage(content="", tool_calls=[{
+                "id": "research-1", "name": "research", "args": {"query": "资料"},
+            }])]}
+
+        async def parent_tools(_state):
+            result = await research.ainvoke({"query": "资料"})
+            return {"messages": [ToolMessage(content=result, tool_call_id="research-1")]}
+
+        parent_graph = StateGraph(InnerState)
+        parent_graph.add_node("model", parent_model)
+        parent_graph.add_node("tools", parent_tools)
+        parent_graph.add_edge(START, "model")
+        parent_graph.add_edge("model", "tools")
+        parent_graph.add_edge("tools", "model")
+        async def on_token(_token):
+            pass
+        for limit, expected_effects in ((3, []), (4, ["external-search"])):
+            with self.subTest(limit=limit):
+                effects.clear()
+                parent_calls.clear()
+                controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                           RunLimits(max_steps=limit, timeout_seconds=30))
+                controller.start()
+                persisted_steps = []
+
+                async def on_step():
+                    persisted_steps.append(controller.record_step())
+
+                with self.assertRaises(RunLimitError) as raised:
+                    await build_chat_workflow(make_services([])).ainvoke({
+                        "message": "查资料", "session_id": "s1", "user_id": "alice",
+                        "agent": parent_graph.compile(), "on_token": on_token,
+                        "run_controller": controller, "on_step": on_step,
+                    })
+                self.assertEqual(raised.exception.code, "RUN_STEP_LIMIT_EXCEEDED")
+                self.assertEqual(persisted_steps, list(range(1, limit + 1)))
+                self.assertEqual(effects, expected_effects)
+                self.assertEqual(parent_calls, ["model"])
+
+    async def test_real_graph_limit_stops_next_tool_dispatch(self):
+        effects = []
+
+        def model(_state):
+            return {"messages": [AIMessage(content="继续")]}
+
+        def tools(_state):
+            effects.append("tool")
+            return {"messages": []}
+
+        from typing import TypedDict
+
+        class InnerState(TypedDict):
+            messages: list
+
+        graph = StateGraph(InnerState)
+        graph.add_node("model", model)
+        graph.add_node("tools", tools)
+        graph.add_edge(START, "model")
+        graph.add_edge("model", "tools")
+        graph.add_edge("tools", "model")
+        agent = graph.compile()
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=3, timeout_seconds=30))
+        controller.start()
+
+        async def on_token(_token):
+            pass
+
+        async def on_step():
+            controller.record_step()
+
+        with self.assertRaises(GraphRecursionError):
+            await build_chat_workflow(make_services([])).ainvoke({
+                "message": "继续", "session_id": "s1", "user_id": "alice",
+                "agent": agent, "on_token": on_token,
+                "run_controller": controller, "on_step": on_step,
+            })
+        self.assertEqual(effects, ["tool"])
+        self.assertLessEqual(controller.steps, 3)
+
+    async def test_run_limit_reaches_inner_agent_and_counts_updates(self):
+        controller = RunController(uuid.uuid4(), uuid.uuid4(), uuid.uuid4(),
+                                   RunLimits(max_steps=3, timeout_seconds=30))
+        controller.start()
+        agent = FakeAgent()
+        steps = []
+
+        async def on_token(_token):
+            pass
+
+        async def on_step():
+            steps.append(controller.record_step())
+
+        await build_chat_workflow(make_services([])).ainvoke({
+            "message": "你好", "session_id": "s1", "user_id": "alice",
+            "agent": agent, "on_token": on_token,
+            "run_controller": controller, "on_step": on_step,
+        })
+        self.assertEqual(agent.calls[0][1]["config"]["recursion_limit"], 3)
+        self.assertEqual(steps, [1])
+
     async def test_limited_research_reports_incomplete_instead_of_completed(self):
         class LimitedAgent(FakeAgent):
             async def astream(self, payload, **kwargs):

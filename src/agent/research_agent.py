@@ -1,7 +1,11 @@
 """A stateless research worker exposed to the conversation agent as one tool."""
 
+import asyncio
 import json
 import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from langchain.agents import create_agent
@@ -9,10 +13,41 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
+from src.agent.run_policy import RunController, RunLimitError
 
 MAX_RESEARCH_SOURCES = 5
 # Match the knowledge collection's text field bound; retain valid chunks whole.
 MAX_EVIDENCE_BYTES = 4096
+
+
+@dataclass
+class RunStepBudget:
+    """同一 Run 的主图和研究图共享调度步数及持久化回调。"""
+
+    controller: RunController
+    on_step: Callable
+    step_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    research_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    fatal_error: BaseException | None = None
+
+    @property
+    def remaining(self) -> int:
+        return self.controller.limits.max_steps - self.controller.steps
+
+    async def record_step(self) -> None:
+        # 多个工具可能并发执行，先串行申请内存配额，再提交数据库 CAS。
+        async with self.step_lock:
+            try:
+                await self.on_step()
+            except BaseException as exc:
+                # ToolNode 可能将工具异常转成消息；持久化失败必须越过该边界终止整个 Run。
+                self.fatal_error = exc
+                raise
+
+
+active_run_step_budget: ContextVar[RunStepBudget | None] = ContextVar(
+    "active_run_step_budget", default=None,
+)
 
 
 RESEARCH_PROMPT = (
@@ -179,6 +214,29 @@ def build_research_tool(model, search_tools):
 
     async def research_async(query: str, config: RunnableConfig) -> str:
         # SSE 使用异步入口；通信内容与同步入口相同。
+        budget = active_run_step_budget.get()
+        if budget is not None:
+            # 父图已经为工具节点预留一步；子图只能使用剩余配额。
+            async with budget.research_lock:
+                budget.controller.check_active()
+                if budget.remaining <= 0:
+                    raise RunLimitError("RUN_STEP_LIMIT_EXCEEDED")
+                result = None
+                try:
+                    async for part in worker.astream(
+                        {"messages": [{"role": "user", "content": query}]},
+                        config={**worker_config(config), "recursion_limit": budget.remaining},
+                        stream_mode=["values", "updates"], version="v2",
+                    ):
+                        if part["type"] == "updates":
+                            await budget.record_step()
+                        elif part["type"] == "values":
+                            result = part["data"]
+                except GraphRecursionError:
+                    return incomplete_research_result()
+                if result is None:
+                    raise RuntimeError("研究图未返回最终状态")
+                return research_result(result)
         try:
             result = await worker.ainvoke(
                 {"messages": [{"role": "user", "content": query}]},

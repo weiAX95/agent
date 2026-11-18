@@ -61,7 +61,18 @@ async def lifespan(app: FastAPI):
                 text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS BIGINT))"),
                 {"lock_id": CHECKPOINT_SETUP_LOCK_ID},
             )
-            await conn.run_sync(Base.metadata.create_all)
+            # Run 及人工裁决表必须先执行版本化 SQL 迁移；create_all 不能替代正式迁移。
+            await conn.run_sync(
+                Base.metadata.create_all,
+                tables=[table for table in Base.metadata.sorted_tables
+                        if table.name not in {
+                            "agent_runs", "agent_run_reconciliations",
+                            "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
+                        }],
+            )
+            if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
+                    or await conn.scalar(text("SELECT to_regclass('public.agent_run_reconciliations')")) is None):
+                raise RuntimeError("请先执行 migrations/20261117_agent_runs.sql")
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
                 "model_profile VARCHAR(32) NOT NULL DEFAULT 'default'"

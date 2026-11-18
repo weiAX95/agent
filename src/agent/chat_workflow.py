@@ -15,6 +15,8 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END, START, StateGraph
 from src.agent.knowledge_store import search_knowledge_chunks
 from src.agent.knowledge_citations import SAFE_ANSWER, model_support_review, validate_knowledge_answer
+from src.agent.research_agent import RunStepBudget, active_run_step_budget
+from src.agent.run_policy import RunLimitError
 
 logger = logging.getLogger(__name__)
 KNOWLEDGE_COMMAND = "/knowledge"
@@ -104,6 +106,8 @@ class ChatState(TypedDict, total=False):
     callbacks: list | None
     on_token: Callable
     on_activity: Callable | None
+    run_controller: Any
+    on_step: Callable | None
     memory_cache: dict
     get_memories: Callable
     agent_input: dict
@@ -211,18 +215,27 @@ def build_chat_workflow(services: ChatServices):
         research_call_ids: set[str] = set()
         progress_call_ids: set[str] = set()
         progress_updates = 0
+        agent_config = dict(config)
+        if state.get("callbacks"):
+            agent_config["callbacks"] = state["callbacks"]
+        if state.get("run_controller") is not None:
+            # LangGraph 在调度下一个 superstep 前检查递归上限，避免多执行工具。
+            agent_config["recursion_limit"] = state["run_controller"].limits.max_steps
+            state["run_controller"].check_active()
+        budget = (RunStepBudget(state["run_controller"], state["on_step"])
+                  if state.get("run_controller") is not None and state.get("on_step") else None)
+        budget_token = active_run_step_budget.set(budget)
+        reserved_tool_step = False
         try:
             async for part in state["agent"].astream(
                 payload,
-                config=(
-                    {**config, "callbacks": state["callbacks"]}
-                    if state.get("callbacks")
-                    else config
-                ),
+                config=agent_config,
                 context=state["agent_context"],
                 stream_mode=["messages", "updates"],
                 version="v2",
             ):
+                if budget is not None and budget.fatal_error is not None:
+                    raise budget.fatal_error
                 if part["type"] == "messages":
                     chunk, metadata = part["data"]
                     if metadata.get("langgraph_node") == "model":
@@ -232,9 +245,23 @@ def build_chat_workflow(services: ChatServices):
                             if not buffer_answer:
                                 await state["on_token"](token)
                 elif part["type"] == "updates":
+                    tool_update = "tools" in part["data"]
+                    if tool_update and reserved_tool_step:
+                        reserved_tool_step = False
+                    elif budget is not None:
+                        await budget.record_step()
+                    elif state.get("on_step"):
+                        await state["on_step"]()
+                    if tool_update and budget is not None and budget.remaining <= 0:
+                        # 工具节点已完成但配额用尽，不能再让父图安排下一次模型调用。
+                        raise RunLimitError("RUN_STEP_LIMIT_EXCEEDED")
                     messages = part["data"].get("model", {}).get("messages", [])
                     if messages:
                         final_message = messages[-1]
+                        if budget is not None and getattr(final_message, "tool_calls", None):
+                            # 模型决定调用工具时先占用父图工具节点的一步，子图随后只可用剩余额度。
+                            await budget.record_step()
+                            reserved_tool_step = True
                         all_research_call_ids.update(c['id'] for c in getattr(final_message, 'tool_calls', [])
                                                      if c.get('name') == 'research' and c.get('id'))
                         complete = services.content_to_text(messages[-1].content)
@@ -325,6 +352,8 @@ def build_chat_workflow(services: ChatServices):
         except Exception:
             await services.discard_incomplete_turn(state["agent"], config, message_id)
             raise
+        finally:
+            active_run_step_budget.reset(budget_token)
         return {"answer": partial, "status": "done", 'answer_validation':state.get('answer_validation',{})}
 
     def judge(state: ChatState) -> dict:
