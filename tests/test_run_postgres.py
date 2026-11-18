@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import unittest
 import uuid
 from datetime import UTC, datetime
@@ -11,9 +12,12 @@ from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from fastapi import HTTPException
 
+from api.chat_storage import begin_turn
 from api.models import AgentRun, ChatMessage, ChatSession, User
-from api.run_storage import new_run, record_run_step, transition_run
+from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
+from src.agent.checkpoint import make_thread_id
 from src.agent.run_policy import RunLimits, RunStatus
 
 
@@ -32,14 +36,22 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine(DB_URL)
         async with self.engine.begin() as connection:
             await connection.execute(text("DROP TABLE IF EXISTS public.agent_runs"))
+            await connection.execute(text("DROP TABLE IF EXISTS public.side_effect_log"))
             for table in (ChatMessage.__table__, ChatSession.__table__, User.__table__):
                 await connection.run_sync(table.drop, checkfirst=True)
             for table in (User.__table__, ChatSession.__table__, ChatMessage.__table__):
                 await connection.run_sync(table.create)
             migration = Path("migrations/20261117_agent_runs.sql").read_text()
-            await connection.exec_driver_sql(migration)
-            await connection.exec_driver_sql(migration)
+            # asyncpg 预编译语句只接受单条 SQL，按迁移文件中的语句顺序逐条执行。
+            statements = [part.strip() for part in migration.split(";")
+                          if "CREATE TABLE" in part or "ALTER TABLE" in part]
+            for _ in range(2):
+                for statement in statements:
+                    await connection.exec_driver_sql(statement)
             self.assertIsNotNone(await connection.scalar(text("SELECT to_regclass('public.agent_runs')")))
+            await connection.execute(text(
+                "CREATE TABLE public.side_effect_log (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"
+            ))
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.owner, self.session_id, self.message_id, self.request_id = (
             uuid.uuid4() for _ in range(4)
@@ -107,11 +119,68 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
             stored = await recovered.get(AgentRun, run.id)
             self.assertEqual(stored.status, RunStatus.RUNNING)
             self.assertEqual(stored.request_id, self.request_id)
+            self.assertTrue(await mark_run_recovery_required(recovered, run.id))
+            await recovered.commit()
+            self.assertFalse(await transition_run(
+                recovered, run.id, RunStatus.RUNNING, RunStatus.SUCCEEDED
+            ))
+            await recovered.rollback()
             recovered.add(new_run(self.owner, self.session_id, self.request_id,
                                   self.message_id, RunLimits()))
             with self.assertRaises(IntegrityError):
                 await recovered.commit()
             await recovered.rollback()
+
+    async def test_killed_worker_cannot_replay_side_effect(self):
+        crash_session = uuid.uuid4()
+        async with self.sessions() as db:
+            db.add(ChatSession(
+                id=crash_session, owner_id=self.owner, title="故障注入",
+                checkpoint_thread_id=make_thread_id(str(self.owner), str(crash_session)),
+            ))
+            await db.commit()
+
+        child_code = """
+import asyncio, os, uuid
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from api.chat_storage import begin_turn
+
+async def main():
+    engine = create_async_engine(os.environ['RUN_TEST_POSTGRES_URL'])
+    async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+        turn = await begin_turn(db, uuid.UUID(os.environ['RUN_TEST_OWNER']),
+                                uuid.UUID(os.environ['RUN_TEST_SESSION']),
+                                uuid.uuid4(), '故障注入')
+        await turn.start_run()
+        await db.execute(text('INSERT INTO public.side_effect_log DEFAULT VALUES'))
+        await db.commit()
+        os._exit(23)
+
+asyncio.run(main())
+"""
+        env = dict(os.environ, RUN_TEST_OWNER=str(self.owner),
+                   RUN_TEST_SESSION=str(crash_session))
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", child_code, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await child.communicate()
+        self.assertEqual(child.returncode, 23, err.decode())
+
+        async with self.sessions() as recovered:
+            with self.assertRaises(HTTPException) as blocked:
+                await begin_turn(recovered, self.owner, crash_session,
+                                 uuid.uuid4(), "不应重放")
+            self.assertEqual(blocked.exception.status_code, 409)
+            run = await recovered.scalar(select(AgentRun).where(
+                AgentRun.session_id == crash_session
+            ))
+            self.assertEqual((run.status, run.recovery_required), ("running", True))
+            side_effect_count = await recovered.scalar(text(
+                "SELECT count(*) FROM public.side_effect_log"
+            ))
+            self.assertEqual(side_effect_count, 1)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS public.agent_runs (
     status varchar(16) NOT NULL DEFAULT 'created',
     max_steps integer NOT NULL,
     steps integer NOT NULL DEFAULT 0,
+    recovery_required boolean NOT NULL DEFAULT false,
     deadline_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -17,5 +18,9 @@ CREATE TABLE IF NOT EXISTS public.agent_runs (
     CONSTRAINT ck_agent_runs_status CHECK (status IN ('created','running','succeeded','failed','cancelled','timed_out')),
     CONSTRAINT ck_agent_runs_steps CHECK (max_steps > 0 AND steps >= 0 AND steps <= max_steps)
 );
+
+-- 已部署过早期 M2 草稿的测试环境也可重复升级；正式库应核对执行记录。
+ALTER TABLE public.agent_runs
+    ADD COLUMN IF NOT EXISTS recovery_required boolean NOT NULL DEFAULT false;
 
 -- 回滚：确认不再有运行中 Run 后，DROP TABLE public.agent_runs。

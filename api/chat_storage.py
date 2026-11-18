@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import checkpoint_lock_id, make_thread_id
 
 from api.models import AgentRun, ChatLog, ChatMessage, ChatRunEvent, ChatSession
-from api.run_storage import new_run, record_run_step, transition_run
+from api.run_storage import mark_run_recovery_required, new_run, record_run_step, transition_run
 from src.agent.run_policy import RunController, RunLimitError, RunLimits, RunStatus
 
 
@@ -214,6 +214,9 @@ class ChatTurn:
                         self.db, self.run_id, RunStatus.RUNNING, target, now
                     ):
                         raise RuntimeError("Run 终态冲突，消息状态已回滚")
+                elif self.run_id is not None and status == "interrupted":
+                    if not await mark_run_recovery_required(self.db, self.run_id):
+                        raise RuntimeError("Run 恢复标志冲突，消息状态已回滚")
                 await self.db.execute(
                     update(ChatSession)
                     .where(
@@ -244,7 +247,7 @@ class ChatTurn:
 
     async def interrupt_if_streaming(self):
         await self.db.rollback()
-        await self.db.execute(
+        result = await self.db.execute(
             update(ChatMessage)
             .where(
                 ChatMessage.id == self.assistant_id,
@@ -257,6 +260,10 @@ class ChatTurn:
                 finished_at=datetime.now(UTC),
             )
         )
+        if result.rowcount and self.run_id is not None:
+            if not await mark_run_recovery_required(self.db, self.run_id):
+                await self.db.rollback()
+                raise RuntimeError("Run 恢复标志冲突，消息状态已回滚")
         await self.db.commit()
 
 
@@ -303,6 +310,12 @@ async def begin_turn(db, owner, session_id, request_id, message, model_profile="
             stale.status = "interrupted"
             stale.error_code = "CHECKPOINT_RECOVERY_REQUIRED"
             stale.finished_at = stale.updated_at = datetime.now(UTC)
+            run_id = await db.scalar(select(AgentRun.id).where(
+                AgentRun.assistant_message_id == stale.id
+            ))
+            if run_id is not None and not await mark_run_recovery_required(db, run_id):
+                await db.rollback()
+                raise HTTPException(409, "Run 状态冲突，需要人工核对")
             await db.commit()
         raise HTTPException(409, "上次执行异常中断，需要核对上下文；请使用新会话")
 

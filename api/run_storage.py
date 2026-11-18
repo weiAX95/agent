@@ -36,10 +36,11 @@ async def transition_run(db: AsyncSession, run_id: uuid.UUID,
     values = {"status": target, "updated_at": now}
     if target in terminals:
         values["finished_at"] = now
-    result = await db.execute(
-        update(AgentRun).where(AgentRun.id == run_id, AgentRun.status == expected)
-        .values(**values)
-    )
+    conditions = [AgentRun.id == run_id, AgentRun.status == expected]
+    if target in terminals:
+        # 待核对的未知执行结果不能被迟到的 Worker 自动覆盖为终态。
+        conditions.append(AgentRun.recovery_required.is_(False))
+    result = await db.execute(update(AgentRun).where(*conditions).values(**values))
     return result.rowcount == 1
 
 
@@ -52,5 +53,16 @@ async def record_run_step(db: AsyncSession, run_id: uuid.UUID, expected_steps: i
             AgentRun.steps == expected_steps - 1,
             AgentRun.max_steps >= expected_steps,
         ).values(steps=expected_steps, updated_at=datetime.now(UTC))
+    )
+    return result.rowcount == 1
+
+
+async def mark_run_recovery_required(db: AsyncSession, run_id: uuid.UUID) -> bool:
+    """保留未确认的执行事实；恢复人员核对 checkpoint 与工具结果前不裁决终态。"""
+    result = await db.execute(
+        update(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.status.in_((RunStatus.CREATED, RunStatus.RUNNING)),
+        ).values(recovery_required=True, updated_at=datetime.now(UTC))
     )
     return result.rowcount == 1

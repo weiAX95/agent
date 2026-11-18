@@ -127,7 +127,8 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn.assistant.status, "interrupted")
         self.assertEqual(turn.assistant.error_code, "CHECKPOINT_RECOVERY_REQUIRED")
         # 未确认的执行保留 running，后续恢复流程才有权裁决终态。
-        self.assertEqual((await self.db.get(AgentRun, turn.run_id)).status, "running")
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
         with self.assertRaises(HTTPException):
             await self.begin(message="仍然阻止")
 
@@ -169,6 +170,26 @@ class ChatStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await reader.get(ChatMessage, turn.assistant_id)).status, "streaming")
             self.assertEqual((await reader.get(AgentRun, turn.run_id)).status, "cancelled")
             self.assertEqual((await reader.scalars(select(ChatLog))).all(), [])
+
+    async def test_interrupted_run_requires_reconciliation(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.finish("interrupted", "部分回复", "CHECKPOINT_RECOVERY_REQUIRED")
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
+        self.assertFalse(await transition_run(
+            self.db, turn.run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED
+        ))
+        await self.db.rollback()
+
+    async def test_request_cleanup_marks_run_for_recovery(self):
+        turn = await self.begin()
+        await turn.start_run()
+        await turn.interrupt_if_streaming()
+        run = await self.db.get(AgentRun, turn.run_id)
+        self.assertEqual((run.status, run.recovery_required), ("running", True))
+        self.assertEqual((await self.db.get(ChatMessage, turn.assistant_id)).status,
+                         "interrupted")
 
 
 if __name__ == "__main__":
