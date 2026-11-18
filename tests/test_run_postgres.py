@@ -42,6 +42,24 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
                 await connection.run_sync(table.drop, checkfirst=True)
             for table in (User.__table__, ChatSession.__table__, ChatMessage.__table__):
                 await connection.run_sync(table.create)
+            # 模拟目标库已有的旧版会话与消息，再执行新增 Run 表的前向迁移。
+            self.legacy_owner, self.legacy_session, self.legacy_message = (
+                uuid.uuid4() for _ in range(3)
+            )
+            await connection.execute(User.__table__.insert().values(
+                id=self.legacy_owner, username=f"legacy-{self.legacy_owner}",
+                hashed_password="test",
+            ))
+            await connection.execute(ChatSession.__table__.insert().values(
+                id=self.legacy_session, owner_id=self.legacy_owner,
+                title="迁移前会话", checkpoint_thread_id=str(self.legacy_session),
+                next_message_seq=2,
+            ))
+            await connection.execute(ChatMessage.__table__.insert().values(
+                id=self.legacy_message, session_id=self.legacy_session,
+                request_id=uuid.uuid4(), seq=1, role="assistant",
+                status="completed", content="迁移前答案", finished_at=datetime.now(UTC),
+            ))
             migration = Path("migrations/20261117_agent_runs.sql").read_text()
             # asyncpg 预编译语句只接受单条 SQL，按迁移文件中的语句顺序逐条执行。
             statements = [part.strip() for part in migration.split(";")
@@ -50,6 +68,9 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
                 for statement in statements:
                     await connection.exec_driver_sql(statement)
             self.assertIsNotNone(await connection.scalar(text("SELECT to_regclass('public.agent_runs')")))
+            self.assertEqual(await connection.scalar(
+                select(ChatMessage.content).where(ChatMessage.id == self.legacy_message)
+            ), "迁移前答案")
             await connection.execute(text(
                 "CREATE TABLE public.side_effect_log (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"
             ))
@@ -72,6 +93,19 @@ class RunPostgresTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.engine.dispose()
+
+    async def test_legacy_chat_data_survives_forward_and_schema_rollback(self):
+        async with self.engine.begin() as connection:
+            self.assertEqual(await connection.scalar(
+                select(ChatSession.next_message_seq).where(ChatSession.id == self.legacy_session)
+            ), 2)
+            await connection.execute(text("DROP TABLE public.agent_runs"))
+            self.assertEqual(await connection.scalar(
+                select(ChatMessage.content).where(ChatMessage.id == self.legacy_message)
+            ), "迁移前答案")
+            self.assertEqual(await connection.scalar(
+                select(ChatMessage.status).where(ChatMessage.id == self.legacy_message)
+            ), "completed")
 
     async def test_migration_and_terminal_cas_under_concurrency(self):
         run = new_run(self.owner, self.session_id, self.request_id, self.message_id,
