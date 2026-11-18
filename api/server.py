@@ -65,7 +65,10 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(
                 Base.metadata.create_all,
                 tables=[table for table in Base.metadata.sorted_tables
-                        if table.name not in {"agent_runs", "agent_run_reconciliations"}],
+                        if table.name not in {
+                            "agent_runs", "agent_run_reconciliations",
+                            "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
+                        }],
             )
             if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
                     or await conn.scalar(text("SELECT to_regclass('public.agent_run_reconciliations')")) is None):
