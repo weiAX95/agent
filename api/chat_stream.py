@@ -15,6 +15,7 @@ from starlette.responses import StreamingResponse
 from api.chat_storage import ChatTurn
 from src.agent.model_gateway import MODEL_ERROR_MESSAGES, classify_model_error
 from src.agent.llm import active_model_profile
+from src.agent.physical_transport import MeteredRun, active_metered_run
 from src.agent.run_policy import RunLimitError
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,8 @@ def terminal_event(turn: ChatTurn):
                      )}
 
 
-def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profile=None):
+def persisted_chat_response(turn, agent, chat_stream, usage_payload,
+                            model_profile=None, trace_id=None):
     async def replay():
         name, payload = terminal_event(turn)
         yield encode_event(name, payload)
@@ -117,10 +119,15 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
         async def produce():
             nonlocal controller
             profile_token = active_model_profile.set(model_profile)
+            metering_token = None
             deadline_scope = None
             try:
                 try:
                     controller = await turn.start_run()
+                    # 所有同步 Memory 与异步 Agent 请求继承同一 Run 身份。
+                    metering_token = active_metered_run.set(MeteredRun(
+                        turn.run_id, turn.owner_id, trace_id,
+                    ))
 
                     async def on_step():
                         # 主图和研究子图共用步数；数据库 CAS 保存每次已完成的调度。
@@ -204,6 +211,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload, model_profi
                         logger.exception("Could not mark interrupted request_id=%s", turn.request_id)
                 await queue.put(("error", {"code": "SAVE_FAILED", "message": "保存对话失败，执行结果待核对；请勿直接重复生成。"}))
             finally:
+                if metering_token is not None:
+                    active_metered_run.reset(metering_token)
                 active_model_profile.reset(profile_token)
 
         producer = asyncio.create_task(produce())

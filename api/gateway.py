@@ -19,6 +19,7 @@ class ChatBodyLimitMiddleware:
             return
 
         trace_id = uuid.uuid4().hex
+        scope["gateway_trace_id"] = trace_id
         async def traced_send(event):
             if event["type"] == "http.response.start":
                 event = {**event, "headers": [*event.get("headers", []),

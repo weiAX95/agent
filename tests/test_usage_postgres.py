@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import select, text
+import httpx
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -19,6 +20,10 @@ from api.models import (
 from api.run_storage import new_run
 from api.usage_storage import (
     finish_model_call, get_run_usage_summary, record_usage_receipt, start_model_call,
+)
+from api.usage_attempt_sink import DatabaseAttemptSink
+from src.agent.physical_transport import (
+    AsyncMeteredClient, MeteredClient, MeteredRun, active_metered_run,
 )
 from src.agent.run_policy import RunLimits
 from src.agent.usage_pricing import TokenUsage
@@ -131,6 +136,48 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(summary.priced_call_count, 2)
                 self.assertEqual(summary.costs_by_currency,
                                  {"USD": Decimal("7.200000000000")})
+            sync_engine = create_engine(make_url(DB_URL).set(drivername="postgresql+psycopg"))
+            try:
+                sink = DatabaseAttemptSink(sync_engine, sessions)
+                run_context = MeteredRun(run_id, owner, "test-trace")
+                sync_call = sink.start(run_context, "openai", "test")
+                sink.finish(sync_call, "failed")
+                async_call = await sink.astart(run_context, "openai", "test")
+                await sink.afinish(async_call, "succeeded")
+                token = active_metered_run.set(run_context)
+                try:
+                    with MeteredClient(sink, "openai", "test", transport=httpx.MockTransport(
+                        lambda request: httpx.Response(200, stream=httpx.ByteStream(b"{}")),
+                    )) as client:
+                        self.assertEqual(client.post(
+                            "https://example.test/v1/chat/completions").status_code, 200)
+                    async with AsyncMeteredClient(
+                        sink, "openai", "test", transport=httpx.MockTransport(
+                            lambda request: httpx.Response(503, stream=httpx.ByteStream(b"{}")),
+                        ),
+                    ) as client:
+                        self.assertEqual((await client.post(
+                            "https://example.test/v1/responses")).status_code, 503)
+                finally:
+                    active_metered_run.reset(token)
+                async with sessions() as db:
+                    for call_id, status in ((sync_call, "failed"),
+                                            (async_call, "succeeded")):
+                        call = await db.get(GatewayModelCall, call_id)
+                        self.assertEqual(call.status, status)
+                        self.assertEqual(call.trace_id, "test-trace")
+                        receipt = await db.scalar(select(GatewayUsageEvent).where(
+                            GatewayUsageEvent.call_id == call_id))
+                        self.assertEqual(receipt.event_key, "transport")
+                        self.assertIsNone(receipt.cost)
+                    recent = (await db.scalars(select(GatewayModelCall).where(
+                        GatewayModelCall.run_id == run_id,
+                        GatewayModelCall.trace_id == "test-trace",
+                    ))).all()
+                    self.assertEqual(sorted(call.status for call in recent),
+                                     ["failed", "failed", "succeeded", "succeeded"])
+            finally:
+                sync_engine.dispose()
             for mutation in (
                 "UPDATE gateway_price_versions SET input_per_million = 999 WHERE id = 'test-price-v1'",
                 "DELETE FROM gateway_price_versions WHERE id = 'test-price-v1'",

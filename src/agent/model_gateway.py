@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 import openai
 from langchain.chat_models import init_chat_model
 
+from src.agent.physical_transport import AsyncMeteredClient, MeteredClient
+
 
 MODEL_ERROR_MESSAGES = {
     "MODEL_TIMEOUT": "模型响应超时，请使用新的 request_id 重试。",
@@ -99,6 +101,12 @@ def default_profile_name(profiles: dict | None = None) -> str:
 
 def build_model(config: ModelGatewayConfig):
     """Retry only an individual upstream model call, never an entire agent run."""
+    from api.usage_attempt_sink import DatabaseAttemptSink
+
+    sink = DatabaseAttemptSink()
+    # HTTP 传输每发送一次都会触发登记；SDK 内部重试也会得到新的 call_id。
+    sync_client = MeteredClient(sink, "openai", config.model)
+    async_client = AsyncMeteredClient(sink, "openai", config.model)
     return init_chat_model(
         model=config.model,
         model_provider="openai",
@@ -106,6 +114,8 @@ def build_model(config: ModelGatewayConfig):
         api_key=config.api_key,
         timeout=config.timeout_seconds,
         max_retries=config.max_retries,
+        http_client=sync_client,
+        http_async_client=async_client,
     )
 
 
