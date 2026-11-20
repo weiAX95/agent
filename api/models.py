@@ -199,6 +199,8 @@ class GatewayModelCall(Base):
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="started")
+    price_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gateway_price_versions.id", ondelete="RESTRICT"))
     trace_id: Mapped[str | None] = mapped_column(String(128))
     upstream_request_id: Mapped[str | None] = mapped_column(String(128))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

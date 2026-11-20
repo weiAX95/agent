@@ -17,7 +17,9 @@ from api.models import (
     GatewayPriceVersion, GatewayUsageEvent, User,
 )
 from api.run_storage import new_run
+from api.usage_storage import finish_model_call, record_usage_receipt, start_model_call
 from src.agent.run_policy import RunLimits
+from src.agent.usage_pricing import TokenUsage
 
 
 DB_URL = os.getenv("USAGE_TEST_POSTGRES_URL")
@@ -44,9 +46,14 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 for _ in range(2):
                     for statement in statements:
                         await connection.exec_driver_sql(statement)
+                    await connection.exec_driver_sql(Path(
+                        "migrations/20261120_gateway_call_price_snapshot.sql").read_text())
                 for name in ("gateway_price_versions", "gateway_model_calls", "gateway_usage_events"):
                     self.assertIsNotNone(await connection.scalar(text(
                         "SELECT to_regclass(:name)"), {"name": f"public.{name}"}))
+                self.assertEqual(await connection.scalar(text(
+                    "SELECT count(*) FROM information_schema.columns WHERE table_name = "
+                    "'gateway_model_calls' AND column_name = 'price_version_id'")), 1)
 
             sessions = async_sessionmaker(engine, expire_on_commit=False)
             owner, session_id, request_id, message_id, call_id = (uuid.uuid4() for _ in range(5))
@@ -61,6 +68,7 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                                    status="streaming", content=""))
                 await db.flush()
                 run = new_run(owner, session_id, request_id, message_id, RunLimits())
+                run_id = run.id
                 db.add(run)
                 await db.flush()
                 db.add(GatewayPriceVersion(
@@ -94,6 +102,23 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(IntegrityError):
                     await db.commit()
                 await db.rollback()
+                # 调用先落库再发送请求；完成后仍可按原始价格接收迟到回执。
+                later_call = await start_model_call(
+                    db, run_id, owner, "openai", "test",
+                )
+                await db.commit()
+                self.assertTrue(await finish_model_call(db, later_call.id, "cancelled"))
+                late = await record_usage_receipt(
+                    db, later_call.id, "late", "cancelled",
+                    TokenUsage(1_000_000, 200_000, 400_000), "provider",
+                )
+                repeated = await record_usage_receipt(
+                    db, later_call.id, "late", "cancelled",
+                    TokenUsage(1_000_000, 200_000, 400_000), "provider",
+                )
+                await db.commit()
+                self.assertEqual(late.id, repeated.id)
+                self.assertEqual(late.cost, Decimal("3.600000000000"))
         finally:
             await engine.dispose()
 
