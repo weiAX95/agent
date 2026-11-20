@@ -17,7 +17,9 @@ from api.models import (
     GatewayPriceVersion, GatewayUsageEvent, User,
 )
 from api.run_storage import new_run
-from api.usage_storage import finish_model_call, record_usage_receipt, start_model_call
+from api.usage_storage import (
+    finish_model_call, get_run_usage_summary, record_usage_receipt, start_model_call,
+)
 from src.agent.run_policy import RunLimits
 from src.agent.usage_pricing import TokenUsage
 
@@ -124,6 +126,11 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
                 self.assertEqual(late.id, repeated.id)
                 self.assertEqual(late.cost, Decimal("3.600000000000"))
+                summary = await get_run_usage_summary(db, run_id, owner)
+                self.assertEqual(summary.call_count, 2)
+                self.assertEqual(summary.priced_call_count, 2)
+                self.assertEqual(summary.costs_by_currency,
+                                 {"USD": Decimal("7.200000000000")})
             for mutation in (
                 "UPDATE gateway_price_versions SET input_per_million = 999 WHERE id = 'test-price-v1'",
                 "DELETE FROM gateway_price_versions WHERE id = 'test-price-v1'",

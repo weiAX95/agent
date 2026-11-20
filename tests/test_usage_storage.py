@@ -11,7 +11,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from api.base import Base
 from api.models import AgentRun, ChatMessage, ChatSession, GatewayPriceVersion, GatewayUsageEvent, User
 from api.run_storage import new_run
-from api.usage_storage import finish_model_call, record_usage_receipt, start_model_call
+from api.usage_storage import (
+    finish_model_call, get_run_usage_summary, record_usage_receipt, start_model_call,
+)
 from src.agent.run_policy import RunLimits
 from src.agent.usage_pricing import TokenUsage
 
@@ -113,6 +115,44 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             events = (await db.scalars(select(GatewayUsageEvent).where(
                 GatewayUsageEvent.call_id == call.id))).all()
             self.assertEqual(len(events), 1)
+
+    async def test_run_total_selects_latest_confirmed_receipt_per_call(self):
+        started = datetime.now(UTC)
+        async with self.sessions() as db:
+            db.add(GatewayPriceVersion(
+                id="summary-price", provider="openai", model="test", currency="USD",
+                input_per_million=Decimal("1"), output_per_million=Decimal("2"),
+                cached_input_per_million=Decimal("0"),
+                effective_at=started - timedelta(days=1),
+            ))
+            await db.flush()
+            billed = await start_model_call(db, self.run_id, self.owner, "openai", "test",
+                                            now=started)
+            unknown = await start_model_call(db, self.run_id, self.owner, "openai", "test",
+                                             now=started)
+            await db.commit()
+        async with self.sessions() as db:
+            await finish_model_call(db, billed.id, "failed")
+            await record_usage_receipt(
+                db, billed.id, "first", "failed", TokenUsage(1_000_000, 0, 0),
+                "provider", now=started + timedelta(seconds=1),
+            )
+            await record_usage_receipt(
+                db, billed.id, "correction", "failed", TokenUsage(2_000_000, 0, 0),
+                "provider", now=started + timedelta(seconds=2),
+            )
+            await record_usage_receipt(
+                db, unknown.id, "missing", "unknown", TokenUsage(None, None, None),
+                "provider", now=started + timedelta(seconds=3),
+            )
+            await db.commit()
+            summary = await get_run_usage_summary(db, self.run_id, self.owner)
+            self.assertEqual(summary.call_count, 2)
+            self.assertEqual(summary.priced_call_count, 1)
+            self.assertEqual(summary.unknown_cost_call_count, 1)
+            self.assertEqual(summary.costs_by_currency, {"USD": Decimal("2.000000")})
+            self.assertEqual((await get_run_usage_summary(
+                db, self.run_id, uuid.uuid4())).call_count, 0)
 
 
 if __name__ == "__main__":

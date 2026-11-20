@@ -1,7 +1,9 @@
 """M3 模型调用与供应商用量回执的事务操作。"""
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +11,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.models import GatewayModelCall, GatewayPriceVersion, GatewayUsageEvent
 from src.agent.usage_pricing import PriceVersion, TokenUsage, calculate_cost
+
+
+@dataclass(frozen=True)
+class RunUsageSummary:
+    call_count: int
+    priced_call_count: int
+    unknown_cost_call_count: int
+    costs_by_currency: dict[str, Decimal]
+
+
+async def get_run_usage_summary(db: AsyncSession, run_id: uuid.UUID,
+                                owner_id: uuid.UUID) -> RunUsageSummary:
+    """按物理调用选最新已确认回执，避免重复回执或修正记录造成重复计费。"""
+    calls = (await db.scalars(select(GatewayModelCall).where(
+        GatewayModelCall.run_id == run_id,
+        GatewayModelCall.owner_id == owner_id,
+    ))).all()
+    if not calls:
+        return RunUsageSummary(0, 0, 0, {})
+    events = (await db.scalars(select(GatewayUsageEvent).where(
+        GatewayUsageEvent.call_id.in_([call.id for call in calls]),
+        GatewayUsageEvent.is_estimated.is_(False),
+        GatewayUsageEvent.cost.is_not(None),
+    ).order_by(GatewayUsageEvent.created_at.desc(), GatewayUsageEvent.id.desc()))).all()
+    # 一次物理请求只选一张已确认账单；失败或取消调用若收到真实费用也计入。
+    chosen = {}
+    for event in events:
+        chosen.setdefault(event.call_id, event)
+    totals: dict[str, Decimal] = {}
+    for event in chosen.values():
+        if event.currency is None:
+            raise ValueError("已计费回执缺少币种")
+        totals[event.currency] = totals.get(event.currency, Decimal(0)) + event.cost
+    return RunUsageSummary(len(calls), len(chosen), len(calls) - len(chosen), totals)
 
 
 def _matches_receipt(event: GatewayUsageEvent, status: str, usage: TokenUsage,
@@ -67,6 +103,7 @@ async def record_usage_receipt(
     db: AsyncSession, call_id: uuid.UUID, event_key: str,
     status: str, usage: TokenUsage, source: str,
     is_estimated: bool = False,
+    now: datetime | None = None,
 ) -> GatewayUsageEvent:
     """按供应商回执键幂等入账；同键不同内容必须报告冲突。"""
     if not event_key or len(event_key) > 128 or not source or len(source) > 32:
@@ -97,6 +134,7 @@ async def record_usage_receipt(
         price_version_id=price.id if cost is not None else None,
         currency=price.currency if cost is not None else None,
         cost=cost, source=source, is_estimated=is_estimated,
+        created_at=now or datetime.now(UTC),
     )
     # 保存点仅回滚冲突插入，保留调用方事务中的 Run 与消息修改。
     try:
