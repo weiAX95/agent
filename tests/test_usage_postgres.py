@@ -9,7 +9,7 @@ from pathlib import Path
 
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.models import (
@@ -48,6 +48,11 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                         await connection.exec_driver_sql(statement)
                     await connection.exec_driver_sql(Path(
                         "migrations/20261120_gateway_call_price_snapshot.sql").read_text())
+                    append_only_sql = Path(
+                        "migrations/20261120_gateway_ledger_append_only.sql").read_text()
+                    for statement in append_only_sql.split("\n\n"):
+                        if "CREATE OR REPLACE" in statement:
+                            await connection.exec_driver_sql(statement)
                 for name in ("gateway_price_versions", "gateway_model_calls", "gateway_usage_events"):
                     self.assertIsNotNone(await connection.scalar(text(
                         "SELECT to_regclass(:name)"), {"name": f"public.{name}"}))
@@ -119,6 +124,21 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
                 self.assertEqual(late.id, repeated.id)
                 self.assertEqual(late.cost, Decimal("3.600000000000"))
+            for mutation in (
+                "UPDATE gateway_price_versions SET input_per_million = 999 WHERE id = 'test-price-v1'",
+                "DELETE FROM gateway_price_versions WHERE id = 'test-price-v1'",
+                "UPDATE gateway_usage_events SET cost = 999 WHERE event_key = 'late'",
+                "DELETE FROM gateway_usage_events WHERE event_key = 'late'",
+            ):
+                with self.subTest(mutation=mutation), self.assertRaises(DBAPIError):
+                    async with engine.begin() as connection:
+                        await connection.execute(text(mutation))
+            async with engine.connect() as connection:
+                self.assertEqual(await connection.scalar(text(
+                    "SELECT input_per_million FROM gateway_price_versions "
+                    "WHERE id = 'test-price-v1'")), Decimal("2.500000"))
+                self.assertEqual(await connection.scalar(text(
+                    "SELECT count(*) FROM gateway_usage_events WHERE event_key = 'late'")), 1)
         finally:
             await engine.dispose()
 
