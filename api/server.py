@@ -33,7 +33,7 @@ from api.config import settings
 from api.gateway import ChatBodyLimitMiddleware
 from api.base import Base
 from api.db import check_db_connection, engine, get_db
-from api.routers import auth, feedback, knowledge, paths, sessions, tasks, topics
+from api.routers import auth, feedback, knowledge, paths, run_diagnostics, sessions, tasks, topics
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,8 @@ app.include_router(auth.router)
 app.include_router(feedback.router)
 app.include_router(knowledge.router)
 app.include_router(sessions.router)
+app.include_router(run_diagnostics.router)
+app.include_router(run_diagnostics.recent_router)
 
 
 @app.get("/api/models")

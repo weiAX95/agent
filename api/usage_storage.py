@@ -90,23 +90,30 @@ async def get_run_usage_summary(db: AsyncSession, run_id: uuid.UUID,
         GatewayModelCall.run_id == run_id,
         GatewayModelCall.owner_id == owner_id,
     ))).all()
-    if not calls:
-        return RunUsageSummary(0, 0, 0, {})
     events = (await db.scalars(select(GatewayUsageEvent).where(
         GatewayUsageEvent.call_id.in_([call.id for call in calls]),
         GatewayUsageEvent.is_estimated.is_(False),
         GatewayUsageEvent.cost.is_not(None),
-    ).order_by(GatewayUsageEvent.created_at.desc(), GatewayUsageEvent.id.desc()))).all()
+    ))).all() if calls else []
+    return summarize_run_usage(calls, events)[0]
+
+
+def summarize_run_usage(
+    calls: list[GatewayModelCall], events: list[GatewayUsageEvent],
+) -> tuple[RunUsageSummary, dict[uuid.UUID, GatewayUsageEvent]]:
+    """同一批账本事件生成汇总与每次调用采用的回执，避免诊断明细口径漂移。"""
     # 一次物理请求只选一张已确认账单；失败或取消调用若收到真实费用也计入。
     chosen = {}
-    for event in events:
+    for event in sorted(events, key=lambda row: (row.created_at, row.id), reverse=True):
+        if event.is_estimated or event.cost is None:
+            continue
         chosen.setdefault(event.call_id, event)
     totals: dict[str, Decimal] = {}
     for event in chosen.values():
         if event.currency is None:
             raise ValueError("已计费回执缺少币种")
         totals[event.currency] = totals.get(event.currency, Decimal(0)) + event.cost
-    return RunUsageSummary(len(calls), len(chosen), len(calls) - len(chosen), totals)
+    return RunUsageSummary(len(calls), len(chosen), len(calls) - len(chosen), totals), chosen
 
 
 def _matches_receipt(event: GatewayUsageEvent, status: str, usage: TokenUsage,
