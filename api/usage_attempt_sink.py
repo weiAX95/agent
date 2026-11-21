@@ -70,11 +70,16 @@ class DatabaseAttemptSink:
                 GatewayModelCall.id == call_id,
                 GatewayModelCall.status == "started",
             ).values(status=status, finished_at=datetime.now(UTC)))
+            event_key = "transport"
             if updated.rowcount != 1:
-                raise RuntimeError("模型调用终态写入冲突")
+                call = db.get(GatewayModelCall, call_id)
+                if call is None or call.status != "unknown":
+                    raise RuntimeError("模型调用终态写入冲突")
+                # 恢复流程已裁决为未知，迟到结果只追加证据，不覆盖该裁决。
+                event_key = "transport-late"
             # 传输层没有供应商 token；明确保存未知，后续确认回执用新事件键追加。
             db.add(GatewayUsageEvent(
-                id=uuid.uuid4(), call_id=call_id, event_key="transport",
+                id=uuid.uuid4(), call_id=call_id, event_key=event_key,
                 status=status, source="transport",
             ))
             db.commit()
@@ -111,10 +116,13 @@ class DatabaseAttemptSink:
 
     async def afinish(self, call_id: uuid.UUID, status: str) -> None:
         async with self._sessions()() as db:
-            if not await finish_model_call(db, call_id, status):
-                raise RuntimeError("模型调用终态写入冲突")
+            changed = await finish_model_call(db, call_id, status)
+            if not changed:
+                call = await db.get(GatewayModelCall, call_id)
+                if call is None or call.status != "unknown":
+                    raise RuntimeError("模型调用终态写入冲突")
             await record_usage_receipt(
-                db, call_id, "transport", status,
+                db, call_id, "transport" if changed else "transport-late", status,
                 TokenUsage(None, None, None), "transport",
             )
             await db.commit()

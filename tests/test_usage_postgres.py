@@ -3,7 +3,7 @@
 import os
 import unittest
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,7 +19,8 @@ from api.models import (
 )
 from api.run_storage import new_run
 from api.usage_storage import (
-    finish_model_call, get_run_usage_summary, record_usage_receipt, start_model_call,
+    finish_model_call, get_run_usage_summary, reconcile_stale_model_calls,
+    record_usage_receipt, start_model_call,
 )
 from api.usage_attempt_sink import DatabaseAttemptSink
 from src.agent.physical_transport import (
@@ -81,6 +82,7 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 await db.flush()
                 run = new_run(owner, session_id, request_id, message_id, RunLimits())
                 run_id = run.id
+                run_deadline = run.deadline_at
                 db.add(run)
                 await db.flush()
                 db.add(GatewayPriceVersion(
@@ -88,7 +90,7 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                     input_per_million=Decimal("2.500000"),
                     output_per_million=Decimal("10.000000"),
                     cached_input_per_million=Decimal("0.250000"),
-                    effective_at=datetime.now(UTC),
+                    effective_at=datetime.now(UTC) - timedelta(days=1),
                 ))
                 db.add(GatewayModelCall(id=call_id, run_id=run.id,
                                         owner_id=owner, provider="openai", model="test"))
@@ -166,13 +168,13 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     active_metered_run.reset(token)
                 async with sessions() as db:
-                    for call_id, status in ((sync_call, "failed"),
-                                            (async_call, "succeeded")):
-                        call = await db.get(GatewayModelCall, call_id)
+                    for observed_call_id, status in ((sync_call, "failed"),
+                                                     (async_call, "succeeded")):
+                        call = await db.get(GatewayModelCall, observed_call_id)
                         self.assertEqual(call.status, status)
                         self.assertEqual(call.trace_id, "test-trace")
                         receipt = await db.scalar(select(GatewayUsageEvent).where(
-                            GatewayUsageEvent.call_id == call_id))
+                            GatewayUsageEvent.call_id == observed_call_id))
                         self.assertEqual(receipt.event_key, "transport")
                         self.assertIsNone(receipt.cost)
                     recent = (await db.scalars(select(GatewayModelCall).where(
@@ -188,6 +190,39 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(confirmed), 2)
                     self.assertTrue(all(event.cost == Decimal("3.600000000000")
                                         for event in confirmed))
+                async with sessions() as db:
+                    stale = await start_model_call(
+                        db, run_id, owner, "openai", "test",
+                        now=run_deadline - timedelta(minutes=3),
+                    )
+                    await db.commit()
+                async with sessions() as db:
+                    recovered = await reconcile_stale_model_calls(
+                        db, now=run_deadline + timedelta(minutes=6),
+                    )
+                    self.assertIn(stale.id, recovered)
+                    self.assertIn(call_id, recovered)
+                    await db.commit()
+                    self.assertEqual(await reconcile_stale_model_calls(
+                        db, now=run_deadline + timedelta(minutes=6)), [])
+                    run_row = await db.get(AgentRun, run_id)
+                    self.assertTrue(run_row.recovery_required)
+                await sink.afinish(stale.id, "succeeded")
+                sink.finish(call_id, "succeeded")
+                await sink.arecord_usage(stale.id, "succeeded",
+                                         TokenUsage(1_000_000, 200_000, 400_000))
+                async with sessions() as db:
+                    self.assertEqual((await db.get(GatewayModelCall, stale.id)).status, "unknown")
+                    evidence = (await db.scalars(select(GatewayUsageEvent).where(
+                        GatewayUsageEvent.call_id == stale.id))).all()
+                    self.assertEqual({event.event_key for event in evidence},
+                                     {"recovery", "transport-late", "provider"})
+                    self.assertEqual(next(event for event in evidence if event.event_key ==
+                                          "provider").cost, Decimal("3.600000000000"))
+                    self.assertIsNotNone(await db.scalar(select(GatewayUsageEvent).where(
+                        GatewayUsageEvent.call_id == call_id,
+                        GatewayUsageEvent.event_key == "transport-late",
+                    )))
             finally:
                 sync_engine.dispose()
             for mutation in (

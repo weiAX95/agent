@@ -9,10 +9,14 @@ from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.base import Base
-from api.models import AgentRun, ChatMessage, ChatSession, GatewayPriceVersion, GatewayUsageEvent, User
+from api.models import (
+    AgentRun, ChatMessage, ChatSession, GatewayModelCall,
+    GatewayPriceVersion, GatewayUsageEvent, User,
+)
 from api.run_storage import new_run
 from api.usage_storage import (
-    finish_model_call, get_run_usage_summary, record_usage_receipt, start_model_call,
+    finish_model_call, get_run_usage_summary, reconcile_stale_model_calls,
+    record_usage_receipt, start_model_call,
 )
 from src.agent.run_policy import RunLimits
 from src.agent.usage_pricing import TokenUsage
@@ -44,6 +48,7 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             db.add(run)
             await db.commit()
             self.run_id = run.id
+            self.run_deadline = run.deadline_at
 
     async def asyncTearDown(self):
         await self.engine.dispose()
@@ -153,6 +158,25 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.costs_by_currency, {"USD": Decimal("2.000000")})
             self.assertEqual((await get_run_usage_summary(
                 db, self.run_id, uuid.uuid4())).call_count, 0)
+
+    async def test_stale_call_requires_deadline_and_never_estimates_cost(self):
+        old_start = self.run_deadline - timedelta(minutes=10)
+        async with self.sessions() as db:
+            call = await start_model_call(db, self.run_id, self.owner,
+                                          "openai", "test", now=old_start)
+            await db.commit()
+        async with self.sessions() as db:
+            self.assertEqual(await reconcile_stale_model_calls(
+                db, now=self.run_deadline + timedelta(seconds=299)), [])
+            self.assertEqual(await reconcile_stale_model_calls(
+                db, now=self.run_deadline + timedelta(seconds=300)), [call.id])
+            await db.commit()
+            self.assertEqual((await db.get(GatewayModelCall, call.id)).status, "unknown")
+            self.assertTrue((await db.get(AgentRun, self.run_id)).recovery_required)
+            recovery = await db.scalar(select(GatewayUsageEvent).where(
+                GatewayUsageEvent.call_id == call.id))
+            self.assertEqual(recovery.event_key, "recovery")
+            self.assertIsNone(recovery.cost)
 
 
 if __name__ == "__main__":
