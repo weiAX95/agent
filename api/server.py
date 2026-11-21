@@ -33,7 +33,7 @@ from api.config import settings
 from api.gateway import ChatBodyLimitMiddleware
 from api.base import Base
 from api.db import check_db_connection, engine, get_db
-from api.routers import auth, feedback, knowledge, paths, sessions, tasks, topics
+from api.routers import auth, feedback, knowledge, paths, run_diagnostics, sessions, tasks, topics
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +68,26 @@ async def lifespan(app: FastAPI):
                         if table.name not in {
                             "agent_runs", "agent_run_reconciliations",
                             "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
+                            "gateway_call_reconciliations",
                         }],
             )
             if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
                     or await conn.scalar(text("SELECT to_regclass('public.agent_run_reconciliations')")) is None):
                 raise RuntimeError("请先执行 migrations/20261117_agent_runs.sql")
+            # 计量启用后，缺少账本或增量迁移时拒绝启动，避免实际调用绕过持久记录。
+            if not await conn.scalar(text(
+                "SELECT to_regclass('public.gateway_price_versions') IS NOT NULL "
+                "AND to_regclass('public.gateway_model_calls') IS NOT NULL "
+                "AND to_regclass('public.gateway_usage_events') IS NOT NULL "
+                "AND to_regclass('public.gateway_call_reconciliations') IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM information_schema.columns WHERE "
+                "table_schema = 'public' AND table_name = 'gateway_model_calls' "
+                "AND column_name = 'price_version_id') "
+                "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_price_append_only') "
+                "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_usage_append_only')"
+                "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_call_reconciliation_append_only')"
+            )):
+                raise RuntimeError("请先执行全部 M3 gateway_usage、call_price_snapshot、ledger_append_only 和 call_reconciliations 迁移")
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
                 "model_profile VARCHAR(32) NOT NULL DEFAULT 'default'"
@@ -143,6 +158,8 @@ app.include_router(auth.router)
 app.include_router(feedback.router)
 app.include_router(knowledge.router)
 app.include_router(sessions.router)
+app.include_router(run_diagnostics.router)
+app.include_router(run_diagnostics.recent_router)
 
 
 @app.get("/api/models")
@@ -214,6 +231,7 @@ async def chat_api(
         turn, getattr(http_request.app.state, "agents", {}).get(
             turn.model_profile, http_request.app.state.agent
         ), chat_stream, _usage_payload, turn.model_profile,
+        getattr(http_request, "scope", {}).get("gateway_trace_id"),
     )
 
 

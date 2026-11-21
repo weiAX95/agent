@@ -199,6 +199,8 @@ class GatewayModelCall(Base):
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="started")
+    price_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gateway_price_versions.id", ondelete="RESTRICT"))
     trace_id: Mapped[str | None] = mapped_column(String(128))
     upstream_request_id: Mapped[str | None] = mapped_column(String(128))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -236,6 +238,20 @@ class GatewayUsageEvent(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     is_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class GatewayCallReconciliation(Base):
+    """失联调用的人工核对身份与证据；一个 call_id 只允许裁决一次。"""
+
+    __tablename__ = "gateway_call_reconciliations"
+
+    call_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("gateway_model_calls.id", ondelete="RESTRICT"), primary_key=True)
+    reviewer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    evidence_ref: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class KnowledgeDocument(Base):

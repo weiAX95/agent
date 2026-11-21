@@ -56,11 +56,13 @@ def build_agent(checkpointer, profile: str | None = None, initialize: bool = Tru
 
 
 def close_agent_resources():
+    from api.usage_attempt_sink import close_usage_sync_engine
     from src.agent.knowledge_database import close_knowledge_database
     close_knowledge_database()
     close_memory_decisions()
     close_memory_resources()
     get_llm.cache_clear()
+    close_usage_sync_engine()
 
 
 # 记忆debugger

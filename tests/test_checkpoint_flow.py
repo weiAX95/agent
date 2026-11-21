@@ -244,6 +244,7 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
         from api.chat_storage import begin_turn
         from api.chat_stream import persisted_chat_response
         from api.models import ChatLog, ChatMessage
+        from src.agent.physical_transport import active_metered_run
         from test_chat_storage import ChatStorageTests
 
         await ChatStorageTests.asyncSetUp(self)
@@ -255,6 +256,8 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
             agent = object()
 
             async def model(**kwargs):
+                self.assertEqual(active_metered_run.get().run_id, turn.run_id)
+                self.assertEqual(active_metered_run.get().owner_id, self.owner)
                 calls.append(kwargs)
                 await kwargs["on_token"]("一段")
                 return "done", "完整回答"
@@ -288,6 +291,7 @@ class ApiThreadpoolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls[0]["user_id"], str(self.owner))
             self.assertEqual(calls[0]["session_id"], str(self.session.id))
             self.assertIs(calls[0]["agent"], agent)
+            self.assertIsNone(active_metered_run.get())
         finally:
             await ChatStorageTests.asyncTearDown(self)
 
@@ -340,7 +344,7 @@ class TokenUsagePayloadTests(unittest.TestCase):
 
 class LifespanTests(unittest.IsolatedAsyncioTestCase):
     def build_fixture(self, *, setup_fails=False, lock_pool_open_fails=False,
-                      missing_run_schema=False):
+                      missing_run_schema=False, missing_usage_schema=False):
         from src.agent.checkpoint import CHECKPOINT_SETUP_LOCK_ID
 
         events = []
@@ -357,6 +361,8 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
 
             async def scalar(self, statement):
                 events.append(("check_run_schema", statement))
+                if missing_usage_schema and "gateway_model_calls" in statement:
+                    return False
                 return None if missing_run_schema else "agent_runs"
 
         class FakeEngine:
@@ -471,6 +477,14 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_run_migration_prevents_startup(self):
         manager, app, events, *_ = self.build_fixture(missing_run_schema=True)
         with self.assertRaisesRegex(RuntimeError, "20261117_agent_runs.sql"):
+            async with manager:
+                pass
+        self.assertNotIn("pool_create", events)
+        self.assertEqual(events[-1], "engine_dispose")
+
+    async def test_missing_usage_migration_prevents_startup(self):
+        manager, app, events, *_ = self.build_fixture(missing_usage_schema=True)
+        with self.assertRaisesRegex(RuntimeError, "M3 gateway_usage"):
             async with manager:
                 pass
         self.assertNotIn("pool_create", events)
