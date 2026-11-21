@@ -68,6 +68,7 @@ async def lifespan(app: FastAPI):
                         if table.name not in {
                             "agent_runs", "agent_run_reconciliations",
                             "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
+                            "gateway_call_reconciliations",
                         }],
             )
             if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
@@ -78,13 +79,15 @@ async def lifespan(app: FastAPI):
                 "SELECT to_regclass('public.gateway_price_versions') IS NOT NULL "
                 "AND to_regclass('public.gateway_model_calls') IS NOT NULL "
                 "AND to_regclass('public.gateway_usage_events') IS NOT NULL "
+                "AND to_regclass('public.gateway_call_reconciliations') IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM information_schema.columns WHERE "
                 "table_schema = 'public' AND table_name = 'gateway_model_calls' "
                 "AND column_name = 'price_version_id') "
                 "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_price_append_only') "
                 "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_usage_append_only')"
+                "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_call_reconciliation_append_only')"
             )):
-                raise RuntimeError("请先执行 M3 gateway_usage、call_price_snapshot 和 ledger_append_only 迁移")
+                raise RuntimeError("请先执行全部 M3 gateway_usage、call_price_snapshot、ledger_append_only 和 call_reconciliations 迁移")
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
                 "model_profile VARCHAR(32) NOT NULL DEFAULT 'default'"

@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.base import Base
 from api.models import (
-    AgentRun, ChatMessage, ChatSession, GatewayModelCall,
+    AgentRun, ChatMessage, ChatSession, GatewayCallReconciliation, GatewayModelCall,
     GatewayPriceVersion, GatewayUsageEvent, User,
 )
 from api.run_storage import new_run
 from api.usage_storage import (
-    finish_model_call, get_run_usage_summary, reconcile_stale_model_calls,
+    finish_model_call, get_run_usage_summary, list_stale_model_calls,
+    reconcile_stale_model_calls,
     record_usage_receipt, start_model_call,
 )
 from src.agent.run_policy import RunLimits
@@ -167,9 +168,12 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
         async with self.sessions() as db:
             self.assertEqual(await reconcile_stale_model_calls(
-                db, now=self.run_deadline + timedelta(seconds=299)), [])
-            self.assertEqual(await reconcile_stale_model_calls(
+                db, self.owner, "test-evidence", now=self.run_deadline + timedelta(seconds=299)), [])
+            self.assertEqual(await list_stale_model_calls(
                 db, now=self.run_deadline + timedelta(seconds=300)), [call.id])
+            self.assertEqual(await reconcile_stale_model_calls(
+                db, self.owner, "test-evidence", now=self.run_deadline + timedelta(seconds=300)),
+                [call.id])
             await db.commit()
             self.assertEqual((await db.get(GatewayModelCall, call.id)).status, "unknown")
             self.assertTrue((await db.get(AgentRun, self.run_id)).recovery_required)
@@ -177,6 +181,9 @@ class UsageStorageTests(unittest.IsolatedAsyncioTestCase):
                 GatewayUsageEvent.call_id == call.id))
             self.assertEqual(recovery.event_key, "recovery")
             self.assertIsNone(recovery.cost)
+            audit = await db.get(GatewayCallReconciliation, call.id)
+            self.assertEqual(audit.reviewer_id, self.owner)
+            self.assertEqual(audit.evidence_ref, "test-evidence")
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_usage_storage.py' -v
           python -m unittest discover -s tests -p 'test_physical_transport.py' -v
           python -m unittest discover -s tests -p 'test_provider_usage.py' -v
+          python -m unittest discover -s tests -p 'test_reconcile_model_calls.py' -v
           python -m unittest discover -s tests -p 'test_rag_eval.py' -v
           python -m unittest discover -s tests -p 'test_research_agent.py' -v
           python -m unittest discover -s tests -p 'test_knowledge_*.py' -v

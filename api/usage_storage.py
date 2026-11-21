@@ -9,7 +9,10 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.models import AgentRun, GatewayModelCall, GatewayPriceVersion, GatewayUsageEvent
+from api.models import (
+    AgentRun, GatewayCallReconciliation, GatewayModelCall,
+    GatewayPriceVersion, GatewayUsageEvent,
+)
 from api.run_storage import mark_run_recovery_required
 from src.agent.usage_pricing import PriceVersion, TokenUsage, calculate_cost
 
@@ -22,22 +25,44 @@ class RunUsageSummary:
     costs_by_currency: dict[str, Decimal]
 
 
-async def reconcile_stale_model_calls(db: AsyncSession, now: datetime | None = None,
-                                      grace_seconds: int = 300,
-                                      limit: int = 100) -> list[uuid.UUID]:
-    """只标记超过 Run 截止时间的失联请求；保留迟到供应商回执的入账空间。"""
+def _stale_call_query(cutoff: datetime, limit: int):
+    return (select(GatewayModelCall).join(AgentRun, AgentRun.id == GatewayModelCall.run_id)
+            .where(GatewayModelCall.status == "started",
+                   GatewayModelCall.started_at <= cutoff,
+                   AgentRun.deadline_at <= cutoff)
+            .order_by(GatewayModelCall.started_at, GatewayModelCall.id)
+            .limit(limit))
+
+
+async def list_stale_model_calls(db: AsyncSession, now: datetime | None = None,
+                                 grace_seconds: int = 300,
+                                 limit: int = 100) -> list[uuid.UUID]:
+    """只读预览候选 call_id，不暴露请求正文或回执内容。"""
+    if type(grace_seconds) is not int or grace_seconds < 0 or not 1 <= limit <= 1000:
+        raise ValueError("失联核对参数无效")
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(seconds=grace_seconds)
+    return list((await db.scalars(_stale_call_query(cutoff, limit).with_only_columns(
+        GatewayModelCall.id))).all())
+
+
+async def reconcile_stale_model_calls(
+    db: AsyncSession, reviewer_id: uuid.UUID, evidence_ref: str,
+    now: datetime | None = None, grace_seconds: int = 300,
+    limit: int = 100,
+) -> list[uuid.UUID]:
+    """人工确认后标未知并写审计；不重放请求，迟到供应商回执仍可追加。"""
+    if not isinstance(reviewer_id, uuid.UUID):
+        raise ValueError("必须提供核对人 UUID")
+    if not evidence_ref.strip() or len(evidence_ref) > 2048:
+        raise ValueError("必须提供不超过 2048 字符的证据引用")
     if type(grace_seconds) is not int or grace_seconds < 0 or not 1 <= limit <= 1000:
         raise ValueError("失联核对参数无效")
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(seconds=grace_seconds)
     calls = (await db.scalars(
-        select(GatewayModelCall).join(AgentRun, AgentRun.id == GatewayModelCall.run_id)
-        .where(GatewayModelCall.status == "started",
-               GatewayModelCall.started_at <= cutoff,
-               AgentRun.deadline_at <= cutoff)
-        .order_by(GatewayModelCall.started_at, GatewayModelCall.id)
-        .limit(limit)
-        .with_for_update(of=GatewayModelCall, skip_locked=True)
+        _stale_call_query(cutoff, limit).with_for_update(
+            of=GatewayModelCall, skip_locked=True)
     )).all()
     reconciled = []
     for call in calls:
@@ -48,6 +73,10 @@ async def reconcile_stale_model_calls(db: AsyncSession, now: datetime | None = N
         db.add(GatewayUsageEvent(
             id=uuid.uuid4(), call_id=call.id, event_key="recovery",
             status="unknown", source="recovery", created_at=now,
+        ))
+        db.add(GatewayCallReconciliation(
+            call_id=call.id, reviewer_id=reviewer_id,
+            evidence_ref=evidence_ref.strip(), created_at=now,
         ))
         reconciled.append(call.id)
     await db.flush()

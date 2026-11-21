@@ -14,12 +14,13 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.models import (
-    AgentRun, ChatMessage, ChatSession, GatewayModelCall,
+    AgentRun, ChatMessage, ChatSession, GatewayCallReconciliation, GatewayModelCall,
     GatewayPriceVersion, GatewayUsageEvent, User,
 )
 from api.run_storage import new_run
 from api.usage_storage import (
-    finish_model_call, get_run_usage_summary, reconcile_stale_model_calls,
+    finish_model_call, get_run_usage_summary, list_stale_model_calls,
+    reconcile_stale_model_calls,
     record_usage_receipt, start_model_call,
 )
 from api.usage_attempt_sink import DatabaseAttemptSink
@@ -28,6 +29,7 @@ from src.agent.physical_transport import (
 )
 from src.agent.run_policy import RunLimits
 from src.agent.usage_pricing import TokenUsage
+from tools.reconcile_model_calls import parse_args, run_command
 
 
 DB_URL = os.getenv("USAGE_TEST_POSTGRES_URL")
@@ -61,6 +63,11 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                     for statement in append_only_sql.split("\n\n"):
                         if "CREATE OR REPLACE" in statement:
                             await connection.exec_driver_sql(statement)
+                    for statement in Path(
+                        "migrations/20261121_gateway_call_reconciliations.sql"
+                    ).read_text().split(";\n"):
+                        if "CREATE TABLE" in statement or "CREATE OR REPLACE TRIGGER" in statement:
+                            await connection.exec_driver_sql(statement.strip() + ";")
                 for name in ("gateway_price_versions", "gateway_model_calls", "gateway_usage_events"):
                     self.assertIsNotNone(await connection.scalar(text(
                         "SELECT to_regclass(:name)"), {"name": f"public.{name}"}))
@@ -196,15 +203,21 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                         now=run_deadline - timedelta(minutes=3),
                     )
                     await db.commit()
+                review_time = run_deadline + timedelta(minutes=6)
+                preview = await run_command(engine, parse_args([]), now=review_time)
+                self.assertEqual(preview["mode"], "preview")
+                self.assertIn(str(stale.id), preview["call_ids"])
+                applied = await run_command(engine, parse_args([
+                    "--apply", "--reviewer-id", str(owner),
+                    "--evidence-ref", "test-provider-check",
+                ]), now=review_time)
+                self.assertEqual(applied["mode"], "apply")
+                self.assertIn(str(stale.id), applied["call_ids"])
+                self.assertIn(str(call_id), applied["call_ids"])
                 async with sessions() as db:
-                    recovered = await reconcile_stale_model_calls(
-                        db, now=run_deadline + timedelta(minutes=6),
-                    )
-                    self.assertIn(stale.id, recovered)
-                    self.assertIn(call_id, recovered)
-                    await db.commit()
                     self.assertEqual(await reconcile_stale_model_calls(
-                        db, now=run_deadline + timedelta(minutes=6)), [])
+                        db, owner, "test-provider-check",
+                        now=review_time), [])
                     run_row = await db.get(AgentRun, run_id)
                     self.assertTrue(run_row.recovery_required)
                 await sink.afinish(stale.id, "succeeded")
@@ -219,6 +232,8 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                                      {"recovery", "transport-late", "provider"})
                     self.assertEqual(next(event for event in evidence if event.event_key ==
                                           "provider").cost, Decimal("3.600000000000"))
+                    self.assertEqual((await db.get(GatewayCallReconciliation, stale.id))
+                                     .evidence_ref, "test-provider-check")
                     self.assertIsNotNone(await db.scalar(select(GatewayUsageEvent).where(
                         GatewayUsageEvent.call_id == call_id,
                         GatewayUsageEvent.event_key == "transport-late",
@@ -230,6 +245,8 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 "DELETE FROM gateway_price_versions WHERE id = 'test-price-v1'",
                 "UPDATE gateway_usage_events SET cost = 999 WHERE event_key = 'late'",
                 "DELETE FROM gateway_usage_events WHERE event_key = 'late'",
+                "UPDATE gateway_call_reconciliations SET evidence_ref = 'changed'",
+                "DELETE FROM gateway_call_reconciliations",
             ):
                 with self.subTest(mutation=mutation), self.assertRaises(DBAPIError):
                     async with engine.begin() as connection:
