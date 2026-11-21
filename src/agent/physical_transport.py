@@ -8,6 +8,9 @@ from typing import Protocol
 
 import httpx
 
+from src.agent.provider_usage import ProviderUsageParser
+from src.agent.usage_pricing import TokenUsage
+
 
 @dataclass(frozen=True)
 class MeteredRun:
@@ -26,6 +29,8 @@ class AttemptSink(Protocol):
     def finish(self, call_id: uuid.UUID, status: str) -> None: ...
     async def astart(self, run: MeteredRun, provider: str, model: str) -> uuid.UUID: ...
     async def afinish(self, call_id: uuid.UUID, status: str) -> None: ...
+    def record_usage(self, call_id: uuid.UUID, status: str, usage: TokenUsage) -> None: ...
+    async def arecord_usage(self, call_id: uuid.UUID, status: str, usage: TokenUsage) -> None: ...
 
 
 def _is_model_request(request: httpx.Request) -> bool:
@@ -48,15 +53,21 @@ class _SyncStream(httpx.SyncByteStream):
                  call_id: uuid.UUID, success: bool):
         self.source, self.sink, self.call_id = source, sink, call_id
         self.success, self.done = success, False
+        self.parser = ProviderUsageParser()
 
     def _finish(self, status: str) -> None:
         if not self.done:
             self.sink.finish(self.call_id, status)
             self.done = True
+            usage = self.parser.finish()
+            if usage is not None:
+                self.sink.record_usage(self.call_id, status, usage)
 
     def __iter__(self):
         try:
-            yield from self.source
+            for chunk in self.source:
+                self.parser.feed(chunk)
+                yield chunk
         except BaseException as exc:
             self._finish(_error_status(exc))
             raise
@@ -75,15 +86,20 @@ class _AsyncStream(httpx.AsyncByteStream):
                  call_id: uuid.UUID, success: bool):
         self.source, self.sink, self.call_id = source, sink, call_id
         self.success, self.done = success, False
+        self.parser = ProviderUsageParser()
 
     async def _finish(self, status: str) -> None:
         if not self.done:
             await self.sink.afinish(self.call_id, status)
             self.done = True
+            usage = self.parser.finish()
+            if usage is not None:
+                await self.sink.arecord_usage(self.call_id, status, usage)
 
     async def __aiter__(self):
         try:
             async for chunk in self.source:
+                self.parser.feed(chunk)
                 yield chunk
         except BaseException as exc:
             await self._finish(_error_status(exc))
@@ -115,7 +131,13 @@ class MeteredClient(httpx.Client):
             self.sink.finish(call_id, _error_status(exc))
             raise
         if response.is_closed:
-            self.sink.finish(call_id, "succeeded" if response.status_code < 400 else "failed")
+            status = "succeeded" if response.status_code < 400 else "failed"
+            self.sink.finish(call_id, status)
+            parser = ProviderUsageParser()
+            parser.feed(response.content)
+            usage = parser.finish()
+            if usage is not None:
+                self.sink.record_usage(call_id, status, usage)
         else:
             response.stream = _SyncStream(response.stream, self.sink, call_id,
                                           response.status_code < 400)
@@ -138,7 +160,13 @@ class AsyncMeteredClient(httpx.AsyncClient):
             await self.sink.afinish(call_id, _error_status(exc))
             raise
         if response.is_closed:
-            await self.sink.afinish(call_id, "succeeded" if response.status_code < 400 else "failed")
+            status = "succeeded" if response.status_code < 400 else "failed"
+            await self.sink.afinish(call_id, status)
+            parser = ProviderUsageParser()
+            parser.feed(response.content)
+            usage = parser.finish()
+            if usage is not None:
+                await self.sink.arecord_usage(call_id, status, usage)
         else:
             response.stream = _AsyncStream(response.stream, self.sink, call_id,
                                            response.status_code < 400)

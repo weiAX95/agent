@@ -16,6 +16,7 @@ class Sink:
     def __init__(self):
         self.started = []
         self.finished = []
+        self.usage = []
 
     def start(self, run, provider, model):
         call_id = uuid.uuid4()
@@ -30,6 +31,12 @@ class Sink:
 
     async def afinish(self, call_id, status):
         self.finish(call_id, status)
+
+    def record_usage(self, call_id, status, usage):
+        self.usage.append((call_id, status, usage))
+
+    async def arecord_usage(self, call_id, status, usage):
+        self.record_usage(call_id, status, usage)
 
 
 class PhysicalTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +101,9 @@ class PhysicalTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(len({call_id for call_id, *_ in self.sink.started}), 2)
         self.assertEqual([status for _, status in self.sink.finished], ["failed", "succeeded"])
+        self.assertEqual(len(self.sink.usage), 1)
+        self.assertEqual(self.sink.usage[0][0], self.sink.started[1][0])
+        self.assertEqual(self.sink.usage[0][2].input_tokens, 2)
 
     async def test_async_timeout_and_success_have_distinct_records(self):
         attempts = 0
@@ -131,6 +141,22 @@ class PhysicalTransportTests(unittest.IsolatedAsyncioTestCase):
                 async for _ in response.aiter_bytes():
                     break
         self.assertEqual([status for _, status in self.sink.finished], ["cancelled"])
+
+    async def test_async_sse_usage_is_bound_to_its_call(self):
+        payload = (b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                   b'data: {"usage":{"prompt_tokens":10,"completion_tokens":2,'
+                   b'"prompt_tokens_details":{"cached_tokens":3}}}\n\n'
+                   b'data: [DONE]\n\n')
+        async with AsyncMeteredClient(
+            self.sink, "openai", "test-model", transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=httpx.ByteStream(payload)),
+            ),
+        ) as client:
+            async with client.stream("POST", "https://example.test/v1/chat/completions") as response:
+                self.assertEqual((await response.aread()), payload)
+        self.assertEqual(self.sink.finished[0][1], "succeeded")
+        self.assertEqual(self.sink.usage[0][0], self.sink.started[0][0])
+        self.assertEqual(self.sink.usage[0][2].cached_input_tokens, 3)
 
 
 if __name__ == "__main__":

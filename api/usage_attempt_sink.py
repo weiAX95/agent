@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from api.models import GatewayModelCall, GatewayPriceVersion, GatewayUsageEvent
 from api.usage_storage import finish_model_call, record_usage_receipt, start_model_call
 from src.agent.physical_transport import MeteredRun
-from src.agent.usage_pricing import TokenUsage
+from src.agent.usage_pricing import PriceVersion, TokenUsage, calculate_cost
 
 
 @lru_cache(maxsize=1)
@@ -79,6 +79,28 @@ class DatabaseAttemptSink:
             ))
             db.commit()
 
+    def record_usage(self, call_id: uuid.UUID, status: str, usage: TokenUsage) -> None:
+        with Session(self._engine()) as db:
+            call = db.get(GatewayModelCall, call_id)
+            if call is None:
+                raise RuntimeError("模型调用不存在，不能记录供应商用量")
+            price = db.get(GatewayPriceVersion, call.price_version_id) if call.price_version_id else None
+            snapshot = (PriceVersion(
+                price.id, price.currency, price.input_per_million,
+                price.output_per_million, price.cached_input_per_million,
+            ) if price else None)
+            cost = calculate_cost(usage, snapshot) if snapshot else None
+            # 供应商回执独立于传输状态事件追加，费用始终引用调用开始时选定的价格。
+            db.add(GatewayUsageEvent(
+                id=uuid.uuid4(), call_id=call_id, event_key="provider",
+                status=status, source="provider",
+                input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                price_version_id=price.id if cost is not None else None,
+                currency=price.currency if cost is not None else None, cost=cost,
+            ))
+            db.commit()
+
     async def astart(self, run: MeteredRun, provider: str, model: str) -> uuid.UUID:
         async with self._sessions()() as db:
             call = await start_model_call(
@@ -95,4 +117,9 @@ class DatabaseAttemptSink:
                 db, call_id, "transport", status,
                 TokenUsage(None, None, None), "transport",
             )
+            await db.commit()
+
+    async def arecord_usage(self, call_id: uuid.UUID, status: str, usage: TokenUsage) -> None:
+        async with self._sessions()() as db:
+            await record_usage_receipt(db, call_id, "provider", status, usage, "provider")
             await db.commit()

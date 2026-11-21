@@ -144,10 +144,15 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                 sink.finish(sync_call, "failed")
                 async_call = await sink.astart(run_context, "openai", "test")
                 await sink.afinish(async_call, "succeeded")
+                await sink.arecord_usage(async_call, "succeeded",
+                                         TokenUsage(1_000_000, 200_000, 400_000))
                 token = active_metered_run.set(run_context)
                 try:
                     with MeteredClient(sink, "openai", "test", transport=httpx.MockTransport(
-                        lambda request: httpx.Response(200, stream=httpx.ByteStream(b"{}")),
+                        lambda request: httpx.Response(200, stream=httpx.ByteStream(
+                            b'{"usage":{"prompt_tokens":1000000,"completion_tokens":200000,'
+                            b'"prompt_tokens_details":{"cached_tokens":400000}}}'
+                        )),
                     )) as client:
                         self.assertEqual(client.post(
                             "https://example.test/v1/chat/completions").status_code, 200)
@@ -176,6 +181,13 @@ class UsagePostgresTests(unittest.IsolatedAsyncioTestCase):
                     ))).all()
                     self.assertEqual(sorted(call.status for call in recent),
                                      ["failed", "failed", "succeeded", "succeeded"])
+                    confirmed = (await db.scalars(select(GatewayUsageEvent).where(
+                        GatewayUsageEvent.call_id.in_([call.id for call in recent]),
+                        GatewayUsageEvent.source == "provider",
+                    ))).all()
+                    self.assertEqual(len(confirmed), 2)
+                    self.assertTrue(all(event.cost == Decimal("3.600000000000")
+                                        for event in confirmed))
             finally:
                 sync_engine.dispose()
             for mutation in (
