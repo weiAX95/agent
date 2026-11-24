@@ -16,6 +16,8 @@ from api.models import (
     ChatMessage, ChatSession, GatewayBudgetAccount, GatewayBudgetAdjustment,
     GatewayBudgetReservation, GatewayPriceVersion, User,
 )
+from api.redis_admission import RELEASE_SCRIPT
+from api.run_admission import GatewayAdmissionPolicy, RunAdmission
 from api.run_storage import new_run, transition_run
 from api.usage_storage import record_usage_receipt, start_model_call
 from src.agent.budget_policy import BudgetExceeded
@@ -231,3 +233,48 @@ class BudgetStorageTests(unittest.IsolatedAsyncioTestCase):
             account = await db.get(GatewayBudgetAccount, account_id)
             self.assertEqual((account.spent_amount, account.reserved_amount),
                              (Decimal("0"), Decimal("7")))
+
+    async def test_run_admission_reserves_and_releases_on_terminal(self):
+        class Redis:
+            releases = 0
+
+            async def eval(self, script, _numkeys, *_args):
+                if script == RELEASE_SCRIPT:
+                    self.releases += 1
+                    return 1
+                return [0, 1, 1]
+
+        account_id, run_id = await self.add_account(), await self.add_run()
+        redis = Redis()
+        admission = RunAdmission(redis, GatewayAdmissionPolicy(5, 2, "USD", Decimal("3")))
+        async with self.sessions() as db:
+            await transition_run(db, run_id, RunStatus.CREATED, RunStatus.RUNNING)
+            await db.commit()
+            await admission.admit(db, run_id, self.owner, 60)
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual(account.reserved_amount, Decimal("3"))
+            await transition_run(db, run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED)
+            await db.commit()
+            await admission.after_execution(db, run_id, self.owner)
+            await db.refresh(account)
+            self.assertEqual((account.spent_amount, account.reserved_amount),
+                             (Decimal("0"), Decimal("0")))
+            self.assertEqual(redis.releases, 1)
+
+    async def test_run_admission_releases_lease_when_budget_missing(self):
+        class Redis:
+            releases = 0
+
+            async def eval(self, script, _numkeys, *_args):
+                if script == RELEASE_SCRIPT:
+                    self.releases += 1
+                    return 1
+                return [0, 1, 1]
+
+        run_id = await self.add_run()
+        redis = Redis()
+        admission = RunAdmission(redis, GatewayAdmissionPolicy(5, 2, "USD", Decimal("3")))
+        async with self.sessions() as db:
+            with self.assertRaises(BudgetNotConfigured):
+                await admission.admit(db, run_id, self.owner, 60)
+            self.assertEqual(redis.releases, 1)

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from redis.asyncio import Redis
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -21,6 +22,7 @@ from api.models import (
 from api.run_storage import new_run, transition_run
 from api.usage_storage import record_usage_receipt, start_model_call
 from api.usage_attempt_sink import DatabaseAttemptSink
+from api.run_admission import GatewayAdmissionPolicy, RunAdmission
 from src.agent.budget_policy import BudgetExceeded
 from src.agent.physical_transport import MeteredRun
 from src.agent.run_policy import RunLimits, RunStatus
@@ -147,5 +149,29 @@ class BudgetPostgresTests(unittest.IsolatedAsyncioTestCase):
                     GatewayBudgetAdjustment.reservation_id == rows[0].id,
                 ))).all()
                 self.assertEqual(len(adjustments), 1)
+
+            redis_url = os.getenv("ADMISSION_TEST_REDIS_URL")
+            if redis_url:
+                redis = Redis.from_url(redis_url, decode_responses=True)
+                try:
+                    await redis.ping()
+                    other_run = run_ids[1] if winner == run_ids[0] else run_ids[0]
+                    admission = RunAdmission(
+                        redis, GatewayAdmissionPolicy(5, 1, "USD", Decimal("3")),
+                    )
+                    async with sessions() as db:
+                        await transition_run(db, other_run, RunStatus.CREATED, RunStatus.RUNNING)
+                        await db.commit()
+                        await admission.admit(db, other_run, owner, 60)
+                        stored = await db.get(GatewayBudgetAccount, account.id)
+                        self.assertEqual(stored.reserved_amount, Decimal("3"))
+                        await transition_run(db, other_run, RunStatus.RUNNING, RunStatus.SUCCEEDED)
+                        await db.commit()
+                        await admission.after_execution(db, other_run, owner)
+                        await db.refresh(stored)
+                        self.assertEqual((stored.spent_amount, stored.reserved_amount),
+                                         (Decimal("2"), Decimal("0")))
+                finally:
+                    await redis.aclose()
         finally:
             await engine.dispose()
