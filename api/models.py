@@ -297,6 +297,29 @@ class GatewayBudgetReservation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class GatewayBudgetAdjustment(Base):
+    """每次确认或更正费用保留一条不可变的账户变动记录。"""
+
+    __tablename__ = "gateway_budget_adjustments"
+    __table_args__ = (
+        CheckConstraint("previous_cost >= 0 AND confirmed_cost >= 0",
+                        name="ck_gateway_budget_adjustment_costs"),
+        CheckConstraint("delta = confirmed_cost - previous_cost",
+                        name="ck_gateway_budget_adjustment_delta"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    reservation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("gateway_budget_reservations.id", ondelete="RESTRICT"), nullable=False,
+    )
+    previous_cost: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    confirmed_cost: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    delta: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
 class KnowledgeDocument(Base):
     """Catalog for the shared knowledge base; Milvus stores its active chunks."""
 

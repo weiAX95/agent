@@ -131,6 +131,12 @@ async def start_model_call(
 ) -> GatewayModelCall:
     """在发出物理请求前登记独立 call_id；调用方必须先提交事务。"""
     started_at = now or datetime.now(UTC)
+    # 结算也锁 Run；阻止终态后再出现新的物理调用，避免漏算已释放的预留。
+    run = await db.scalar(select(AgentRun).where(
+        AgentRun.id == run_id, AgentRun.owner_id == owner_id,
+    ).with_for_update())
+    if run is None or run.status not in {"created", "running"} or run.recovery_required:
+        raise ValueError("Run 不可再发起模型调用")
     price = await db.scalar(
         select(GatewayPriceVersion).where(
             GatewayPriceVersion.provider == provider,
@@ -179,9 +185,14 @@ async def record_usage_receipt(
         raise ValueError("回执标识或来源无效")
     if status not in {"succeeded", "failed", "cancelled", "timed_out", "unknown"}:
         raise ValueError("回执状态无效")
-    call = await db.get(GatewayModelCall, call_id)
+    # 先锁物理调用，再锁 Run，与失联调用核对的锁顺序一致。
+    call = await db.scalar(select(GatewayModelCall).where(
+        GatewayModelCall.id == call_id,
+    ).with_for_update())
     if call is None:
         raise ValueError("物理模型调用不存在")
+    # 预算结算持有 Run 行锁时，后到的回执会在其完成后写入并等待再次对账。
+    await db.scalar(select(AgentRun).where(AgentRun.id == call.run_id).with_for_update())
     existing = await db.scalar(select(GatewayUsageEvent).where(
         GatewayUsageEvent.call_id == call_id, GatewayUsageEvent.event_key == event_key,
     ))

@@ -36,4 +36,19 @@ CREATE TABLE IF NOT EXISTS public.gateway_budget_reservations (
 CREATE INDEX IF NOT EXISTS ix_gateway_budget_reservations_account
     ON public.gateway_budget_reservations(account_id);
 
--- 回滚前须先完成未结预留对账，再删除 reservations，最后删除 accounts。
+-- 迟到回执修正既更新账户累计值，也追加不可变变动记录供运营核对。
+CREATE TABLE IF NOT EXISTS public.gateway_budget_adjustments (
+    id uuid PRIMARY KEY,
+    reservation_id uuid NOT NULL REFERENCES public.gateway_budget_reservations(id) ON DELETE RESTRICT,
+    previous_cost numeric(30,12) NOT NULL,
+    confirmed_cost numeric(30,12) NOT NULL,
+    delta numeric(30,12) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_gateway_budget_adjustment_costs CHECK (previous_cost >= 0 AND confirmed_cost >= 0),
+    CONSTRAINT ck_gateway_budget_adjustment_delta CHECK (delta = confirmed_cost - previous_cost)
+);
+
+CREATE INDEX IF NOT EXISTS ix_gateway_budget_adjustments_reservation
+    ON public.gateway_budget_adjustments(reservation_id);
+
+-- 回滚前须先完成未结预留对账，再按 adjustments、reservations、accounts 顺序删除。

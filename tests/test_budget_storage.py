@@ -9,13 +9,18 @@ from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.base import Base
-from api.budget_storage import BudgetNotConfigured, reserve_run_budget
-from api.models import (
-    ChatMessage, ChatSession, GatewayBudgetAccount, GatewayBudgetReservation, User,
+from api.budget_storage import (
+    BudgetNotConfigured, reserve_run_budget, settle_run_budget_from_usage,
 )
-from api.run_storage import new_run
+from api.models import (
+    ChatMessage, ChatSession, GatewayBudgetAccount, GatewayBudgetAdjustment,
+    GatewayBudgetReservation, GatewayPriceVersion, User,
+)
+from api.run_storage import new_run, transition_run
+from api.usage_storage import record_usage_receipt, start_model_call
 from src.agent.budget_policy import BudgetExceeded
-from src.agent.run_policy import RunLimits
+from src.agent.run_policy import RunLimits, RunStatus
+from src.agent.usage_pricing import TokenUsage
 
 
 class BudgetStorageTests(unittest.IsolatedAsyncioTestCase):
@@ -109,3 +114,120 @@ class BudgetStorageTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await reserve_run_budget(db, run_id, self.owner, "USD",
                                          self.today, 1.0)
+
+    async def test_settlement_and_late_correction_are_idempotent(self):
+        account_id, run_id = await self.add_account(), await self.add_run()
+        async with self.sessions() as db:
+            db.add(GatewayPriceVersion(
+                id="budget-usd", provider="test", model="budget", currency="USD",
+                input_per_million=Decimal("1"), output_per_million=Decimal("0"),
+                cached_input_per_million=Decimal("0"),
+                effective_at=datetime.now(UTC),
+            ))
+            await db.flush()
+            await reserve_run_budget(db, run_id, self.owner, "USD", self.today, Decimal("7"))
+            call = await start_model_call(db, run_id, self.owner, "test", "budget")
+            await transition_run(db, run_id, RunStatus.CREATED, RunStatus.RUNNING)
+            await record_usage_receipt(db, call.id, "first", "succeeded",
+                                       TokenUsage(2_000_000, 0, 0), "provider")
+            still_reserved = await settle_run_budget_from_usage(db, run_id, self.owner)
+            self.assertEqual(still_reserved.status, "reserved")
+            await transition_run(db, run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED)
+            await db.commit()
+        async with self.sessions() as db:
+            settled = await settle_run_budget_from_usage(db, run_id, self.owner)
+            await settle_run_budget_from_usage(db, run_id, self.owner)
+            await db.commit()
+            self.assertEqual(settled.confirmed_cost, Decimal("2"))
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual((account.spent_amount, account.reserved_amount),
+                             (Decimal("2"), Decimal("0")))
+            self.assertEqual(len((await db.scalars(select(GatewayBudgetAdjustment))).all()), 1)
+        async with self.sessions() as db:
+            await record_usage_receipt(db, call.id, "correction", "succeeded",
+                                       TokenUsage(3_000_000, 0, 0), "provider")
+            await db.commit()
+        async with self.sessions() as db:
+            corrected = await settle_run_budget_from_usage(db, run_id, self.owner)
+            await settle_run_budget_from_usage(db, run_id, self.owner)
+            await db.commit()
+            self.assertEqual(corrected.confirmed_cost, Decimal("3"))
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual((account.spent_amount, account.reserved_amount),
+                             (Decimal("3"), Decimal("0")))
+            adjustments = (await db.scalars(select(GatewayBudgetAdjustment).order_by(
+                GatewayBudgetAdjustment.created_at))).all()
+            self.assertEqual(sorted(row.delta for row in adjustments),
+                             [Decimal("1"), Decimal("2")])
+            with self.assertRaisesRegex(ValueError, "不可再发起"):
+                await start_model_call(db, run_id, self.owner, "test", "budget")
+        async with self.sessions() as db:
+            await record_usage_receipt(db, call.id, "lower-correction", "succeeded",
+                                       TokenUsage(1_000_000, 0, 0), "provider")
+            await settle_run_budget_from_usage(db, run_id, self.owner)
+            await db.commit()
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual(account.spent_amount, Decimal("1"))
+            adjustments = (await db.scalars(select(GatewayBudgetAdjustment))).all()
+            self.assertEqual(sorted(row.delta for row in adjustments),
+                             [Decimal("-2"), Decimal("1"), Decimal("2")])
+
+    async def test_unknown_cost_keeps_reservation_until_late_receipt(self):
+        account_id, run_id = await self.add_account(), await self.add_run()
+        async with self.sessions() as db:
+            db.add(GatewayPriceVersion(
+                id="late-usd", provider="test", model="late", currency="USD",
+                input_per_million=Decimal("1"), output_per_million=Decimal("0"),
+                cached_input_per_million=Decimal("0"),
+                effective_at=datetime.now(UTC),
+            ))
+            await db.flush()
+            await reserve_run_budget(db, run_id, self.owner, "USD", self.today, Decimal("7"))
+            call = await start_model_call(db, run_id, self.owner, "test", "late")
+            await transition_run(db, run_id, RunStatus.CREATED, RunStatus.RUNNING)
+            await record_usage_receipt(db, call.id, "missing", "cancelled",
+                                       TokenUsage(None, None, None), "provider")
+            await transition_run(db, run_id, RunStatus.RUNNING, RunStatus.CANCELLED)
+            await db.commit()
+        async with self.sessions() as db:
+            reservation = await settle_run_budget_from_usage(db, run_id, self.owner)
+            self.assertEqual(reservation.status, "reserved")
+            self.assertEqual((await db.get(GatewayBudgetAccount, account_id)).reserved_amount,
+                             Decimal("7"))
+            self.assertEqual(len((await db.scalars(select(GatewayBudgetAdjustment))).all()), 0)
+        async with self.sessions() as db:
+            await record_usage_receipt(db, call.id, "late", "cancelled",
+                                       TokenUsage(4_000_000, 0, 0), "provider")
+            await db.commit()
+        async with self.sessions() as db:
+            reservation = await settle_run_budget_from_usage(db, run_id, self.owner)
+            await db.commit()
+            self.assertEqual(reservation.confirmed_cost, Decimal("4"))
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual((account.spent_amount, account.reserved_amount),
+                             (Decimal("4"), Decimal("0")))
+
+    async def test_mismatched_currency_fails_closed(self):
+        account_id, run_id = await self.add_account(), await self.add_run()
+        async with self.sessions() as db:
+            db.add(GatewayPriceVersion(
+                id="budget-eur", provider="test", model="foreign", currency="EUR",
+                input_per_million=Decimal("1"), output_per_million=Decimal("0"),
+                cached_input_per_million=Decimal("0"),
+                effective_at=datetime.now(UTC),
+            ))
+            await db.flush()
+            await reserve_run_budget(db, run_id, self.owner, "USD", self.today, Decimal("7"))
+            call = await start_model_call(db, run_id, self.owner, "test", "foreign")
+            await transition_run(db, run_id, RunStatus.CREATED, RunStatus.RUNNING)
+            await record_usage_receipt(db, call.id, "eur", "succeeded",
+                                       TokenUsage(1_000_000, 0, 0), "provider")
+            await transition_run(db, run_id, RunStatus.RUNNING, RunStatus.SUCCEEDED)
+            await db.commit()
+        async with self.sessions() as db:
+            with self.assertRaisesRegex(ValueError, "币种"):
+                await settle_run_budget_from_usage(db, run_id, self.owner)
+            await db.rollback()
+            account = await db.get(GatewayBudgetAccount, account_id)
+            self.assertEqual((account.spent_amount, account.reserved_amount),
+                             (Decimal("0"), Decimal("7")))

@@ -12,14 +12,17 @@ from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from api.budget_storage import reserve_run_budget
+from api.budget_storage import reserve_run_budget, settle_run_budget_from_usage
 from api.models import (
     AgentRun, ChatMessage, ChatSession, GatewayBudgetAccount,
-    GatewayBudgetReservation, User,
+    GatewayBudgetAdjustment, GatewayBudgetReservation, GatewayModelCall,
+    GatewayPriceVersion, GatewayUsageEvent, User,
 )
-from api.run_storage import new_run
+from api.run_storage import new_run, transition_run
+from api.usage_storage import record_usage_receipt, start_model_call
 from src.agent.budget_policy import BudgetExceeded
-from src.agent.run_policy import RunLimits
+from src.agent.run_policy import RunLimits, RunStatus
+from src.agent.usage_pricing import TokenUsage
 
 
 DB_URL = os.getenv("BUDGET_TEST_POSTGRES_URL")
@@ -37,14 +40,16 @@ class BudgetPostgresTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with engine.begin() as connection:
                 for table in (User.__table__, ChatSession.__table__, ChatMessage.__table__,
-                              AgentRun.__table__):
+                              AgentRun.__table__, GatewayPriceVersion.__table__,
+                              GatewayModelCall.__table__, GatewayUsageEvent.__table__):
                     await connection.run_sync(table.create, checkfirst=True)
                 migration = Path("migrations/20261124_gateway_budget_reservations.sql").read_text()
                 for _ in range(2):
                     for statement in migration.split(";"):
                         if statement.strip() and "CREATE " in statement:
                             await connection.exec_driver_sql(statement.strip())
-                for name in ("gateway_budget_accounts", "gateway_budget_reservations"):
+                for name in ("gateway_budget_accounts", "gateway_budget_reservations",
+                             "gateway_budget_adjustments"):
                     self.assertIsNotNone(await connection.scalar(text(
                         "SELECT to_regclass(:name)"), {"name": f"public.{name}"}))
 
@@ -100,5 +105,37 @@ class BudgetPostgresTests(unittest.IsolatedAsyncioTestCase):
                     GatewayBudgetReservation.account_id == account.id,
                 ))).all()
                 self.assertEqual(len(rows), 1)
+
+            async with sessions() as db:
+                db.add(GatewayPriceVersion(
+                    id=f"m4-{winner}", provider="test", model="m4", currency="USD",
+                    input_per_million=Decimal("1"), output_per_million=Decimal("0"),
+                    cached_input_per_million=Decimal("0"),
+                    effective_at=datetime.now(UTC),
+                ))
+                await db.flush()
+                call = await start_model_call(db, winner, owner, "test", "m4")
+                await transition_run(db, winner, RunStatus.CREATED, RunStatus.RUNNING)
+                await record_usage_receipt(db, call.id, "actual", "succeeded",
+                                           TokenUsage(2_000_000, 0, 0), "provider")
+                await transition_run(db, winner, RunStatus.RUNNING, RunStatus.SUCCEEDED)
+                await db.commit()
+
+            async def settle():
+                async with sessions() as db:
+                    result = await settle_run_budget_from_usage(db, winner, owner)
+                    await db.commit()
+                    return result.confirmed_cost
+
+            self.assertEqual(await asyncio.gather(settle(), settle()),
+                             [Decimal("2"), Decimal("2")])
+            async with sessions() as db:
+                stored = await db.get(GatewayBudgetAccount, account.id)
+                self.assertEqual((stored.spent_amount, stored.reserved_amount),
+                                 (Decimal("2"), Decimal("0")))
+                adjustments = (await db.scalars(select(GatewayBudgetAdjustment).where(
+                    GatewayBudgetAdjustment.reservation_id == rows[0].id,
+                ))).all()
+                self.assertEqual(len(adjustments), 1)
         finally:
             await engine.dispose()
