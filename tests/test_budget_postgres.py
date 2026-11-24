@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from sqlalchemy import select, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -20,7 +20,9 @@ from api.models import (
 )
 from api.run_storage import new_run, transition_run
 from api.usage_storage import record_usage_receipt, start_model_call
+from api.usage_attempt_sink import DatabaseAttemptSink
 from src.agent.budget_policy import BudgetExceeded
+from src.agent.physical_transport import MeteredRun
 from src.agent.run_policy import RunLimits, RunStatus
 from src.agent.usage_pricing import TokenUsage
 
@@ -120,6 +122,14 @@ class BudgetPostgresTests(unittest.IsolatedAsyncioTestCase):
                                            TokenUsage(2_000_000, 0, 0), "provider")
                 await transition_run(db, winner, RunStatus.RUNNING, RunStatus.SUCCEEDED)
                 await db.commit()
+
+            sync_engine = create_engine(make_url(DB_URL).set(drivername="postgresql+psycopg"))
+            try:
+                sink = DatabaseAttemptSink(sync_engine, sessions)
+                with self.assertRaisesRegex(ValueError, "不可再发起"):
+                    sink.start(MeteredRun(winner, owner), "test", "m4")
+            finally:
+                sync_engine.dispose()
 
             async def settle():
                 async with sessions() as db:
