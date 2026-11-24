@@ -12,6 +12,7 @@ import datetime
 import io
 import json
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -344,7 +345,8 @@ class TokenUsagePayloadTests(unittest.TestCase):
 
 class LifespanTests(unittest.IsolatedAsyncioTestCase):
     def build_fixture(self, *, setup_fails=False, lock_pool_open_fails=False,
-                      missing_run_schema=False, missing_usage_schema=False):
+                      missing_run_schema=False, missing_usage_schema=False,
+                      missing_budget_schema=False, gateway_enabled=False):
         from src.agent.checkpoint import CHECKPOINT_SETUP_LOCK_ID
 
         events = []
@@ -362,6 +364,8 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             async def scalar(self, statement):
                 events.append(("check_run_schema", statement))
                 if missing_usage_schema and "gateway_model_calls" in statement:
+                    return False
+                if missing_budget_schema and "gateway_budget_accounts" in statement:
                     return False
                 return None if missing_run_schema else "agent_runs"
 
@@ -429,7 +433,14 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
                 jwt_verifying_key="test-verifying-key",
                 jwt_issuer="test-issuer",
                 jwt_audience="test-audience",
+                gateway_admission_enabled=gateway_enabled,
+                gateway_rpm_limit=5,
+                gateway_concurrent_limit=2,
+                gateway_budget_currency="USD",
+                gateway_reservation_amount=Decimal("3"),
+                gateway_redis_url="redis://local-test",
             ),
+            "GatewayAdmissionPolicy": lambda *_args: object(),
             "checkpoint_dsn": lambda url: "postgresql://u:p@h/db",
             "CHECKPOINT_SETUP_LOCK_ID": CHECKPOINT_SETUP_LOCK_ID,
             "dict_row": row_factory,
@@ -485,6 +496,16 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_usage_migration_prevents_startup(self):
         manager, app, events, *_ = self.build_fixture(missing_usage_schema=True)
         with self.assertRaisesRegex(RuntimeError, "M3 gateway_usage"):
+            async with manager:
+                pass
+        self.assertNotIn("pool_create", events)
+        self.assertEqual(events[-1], "engine_dispose")
+
+    async def test_enabled_gateway_requires_budget_migration(self):
+        manager, _app, events, *_ = self.build_fixture(
+            gateway_enabled=True, missing_budget_schema=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "20261124_gateway_budget_reservations.sql"):
             async with manager:
                 pass
         self.assertNotIn("pool_create", events)
