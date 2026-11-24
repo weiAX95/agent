@@ -133,6 +133,20 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
             metering_token = None
             deadline_scope = None
             admitted = False
+
+            async def finalize_admission():
+                nonlocal admitted
+                if not admitted:
+                    return
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await run_admission.after_execution(
+                            turn.db, turn.run_id, turn.owner_id,
+                        )
+                    except Exception:
+                        logger.exception("Gateway finalization failed; run_id=%s", turn.run_id)
+                admitted = False
+
             try:
                 try:
                     controller = await turn.start_run()
@@ -168,6 +182,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     # A model that propagates cancellation has not confirmed checkpoint cleanup.
                     with anyio.CancelScope(shield=True):
                         await record_failure("CHECKPOINT_RECOVERY_REQUIRED", partial, True)
+                        await finalize_admission()
                     await queue.put(("error", {
                         "code": "CHECKPOINT_RECOVERY_REQUIRED",
                         "message": "生成异常中断，请使用新会话或先核对上下文。",
@@ -194,6 +209,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                         )
                     logger.exception("Chat generation failed; request_id=%s code=%s", turn.request_id, code)
                     await record_failure(code, partial)
+                    await finalize_admission()
                     await queue.put(("usage", usage_payload(usage)))
                     await queue.put(("error", {"code": code, "message": message}))
                     return
@@ -216,6 +232,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     await queue.put(("agent_step", memory_event))
                     await turn.finish("completed" if status == "done" else "stopped", answer or "",
                                       memory_status=memory_status)
+                    # 先结算和清理，再发 SSE 终止事件；断线不能打断已确认终态的清理。
+                    await finalize_admission()
                 await queue.put(("usage", usage_payload(usage)))
                 await queue.put(terminal_event(turn))
                 logger.info(
@@ -229,18 +247,13 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     try:
                         await turn.db.rollback()
                         await record_failure("CHECKPOINT_RECOVERY_REQUIRED", partial, True)
+                        await finalize_admission()
                     except Exception:
                         logger.exception("Could not mark interrupted request_id=%s", turn.request_id)
                 await queue.put(("error", {"code": "SAVE_FAILED", "message": "保存对话失败，执行结果待核对；请勿直接重复生成。"}))
             finally:
                 if admitted:
-                    with anyio.CancelScope(shield=True):
-                        try:
-                            await run_admission.after_execution(
-                                turn.db, turn.run_id, turn.owner_id,
-                            )
-                        except Exception:
-                            logger.exception("Gateway finalization failed; run_id=%s", turn.run_id)
+                    await finalize_admission()
                 if metering_token is not None:
                     active_metered_run.reset(metering_token)
                 active_model_profile.reset(profile_token)

@@ -36,7 +36,7 @@
 ### `/api/chat` 入口接线切片
 
 - 仅当 `GATEWAY_ADMISSION_ENABLED=true` 时启用 M4。启动前需配置 `GATEWAY_REDIS_URL`、`GATEWAY_RPM_LIMIT`、`GATEWAY_CONCURRENT_LIMIT`、`GATEWAY_BUDGET_CURRENCY`、`GATEWAY_RESERVATION_AMOUNT`，执行 M4 迁移并预建相应用户当日预算账户；缺少配置、迁移或 Redis 连接时启动失败。
-- 新 Run 在模型发送前依次申请 Redis 租约和 PostgreSQL 预算预留；预算失败会回滚并释放租约。终态尝试结算并释放并发租约，未知费用保留预算预留，异常中断依赖租约 TTL。SSE 请求重放保留稳定的网关拒绝错误码和中文消息。
+- 新 Run 在模型发送前依次申请 Redis 租约和 PostgreSQL 预算预留；预算失败会回滚并释放租约。已确认终态在 SSE 终止事件发送前尝试结算并释放并发租约，未知费用保留预算预留，异常中断依赖租约 TTL。SSE 请求重放保留稳定的网关拒绝错误码和中文消息。
 - HTTP 离线测试覆盖准入先于模型、拒绝后不调用模型及错误重放；预算存储测试覆盖成功结算和预留失败释放。一次性 PostgreSQL 18 + Redis 7 组合测试通过申请、预留、终态结算和释放；Redis 独立测试覆盖双客户端共享并发、RPM 与过期。
 - 当前配置为所有用户使用同一组限额参数，正式账户额度需外部预建。尚未在真实服务启动和多 Worker 压测中验收，也没有自动迟到回执对账任务。
 

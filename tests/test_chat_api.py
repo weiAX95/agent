@@ -19,12 +19,16 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gateway_admission_precedes_model_and_finalizes_after_run(self):
         steps = []
+        finishing = asyncio.Event()
+        allow_finish = asyncio.Event()
 
         class Admission:
             async def admit(self, _db, _run_id, _owner_id, _timeout):
                 steps.append("admit")
 
             async def after_execution(self, _db, _run_id, _owner_id):
+                finishing.set()
+                await allow_finish.wait()
                 steps.append("finish")
 
         async def model(**_kwargs):
@@ -33,11 +37,17 @@ class ChatApiTests(unittest.IsolatedAsyncioTestCase):
 
         app = make_app(self.factory, MemoryLockPool(), model, Admission())
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            result = await client.post(
+            request = asyncio.create_task(client.post(
                 "/api/chat", headers={"x-test-user": str(self.owner)},
                 json={"session_id": str(self.session.id), "request_id": str(uuid.uuid4()),
                       "message": "问题"},
-            )
+            ))
+            try:
+                await asyncio.wait_for(finishing.wait(), 2)
+                self.assertFalse(request.done())
+            finally:
+                allow_finish.set()
+            result = await asyncio.wait_for(request, 2)
         self.assertIn("event: done", result.text)
         self.assertEqual(steps, ["admit", "model", "finish"])
 
