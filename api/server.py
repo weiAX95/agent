@@ -69,6 +69,7 @@ async def lifespan(app: FastAPI):
                             "agent_runs", "agent_run_reconciliations",
                             "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
                             "gateway_call_reconciliations",
+                            "gateway_budget_accounts", "gateway_budget_reservations",
                         }],
             )
             if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
