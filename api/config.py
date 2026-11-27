@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from pydantic_settings import BaseSettings
 
 
@@ -10,6 +12,14 @@ class Settings(BaseSettings):
     jwt_issuer: str  # 令牌签发者标识，如 "agent-api"
     jwt_audience: str  # 预期接收方标识，如 "agent-web"
     jwt_access_token_expire_minutes: int = 15
+
+    # M4 仅在预算账户和 Redis 都已准备好时显式启用，避免旧部署隐式改变聊天行为。
+    gateway_admission_enabled: bool = False
+    gateway_redis_url: str | None = None
+    gateway_rpm_limit: int | None = None
+    gateway_concurrent_limit: int | None = None
+    gateway_budget_currency: str | None = None
+    gateway_reservation_amount: Decimal | None = None
 
     class Config:
         env_file = ".env"

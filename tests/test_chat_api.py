@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from api.models import ChatMessage, ChatSession
+from api.redis_admission import AdmissionDenied
 from chat_api_fixture import MemoryLockPool, make_app
 import test_chat_storage as fixtures
 
@@ -15,6 +16,70 @@ import test_chat_storage as fixtures
 class ChatApiTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.ChatStorageTests.asyncSetUp
     asyncTearDown = fixtures.ChatStorageTests.asyncTearDown
+
+    async def test_gateway_admission_precedes_model_and_finalizes_after_run(self):
+        steps = []
+        finishing = asyncio.Event()
+        allow_finish = asyncio.Event()
+
+        class Admission:
+            async def admit(self, _db, _run_id, _owner_id, _timeout):
+                steps.append("admit")
+
+            async def after_execution(self, _db, _run_id, _owner_id):
+                finishing.set()
+                await allow_finish.wait()
+                steps.append("finish")
+
+        async def model(**_kwargs):
+            steps.append("model")
+            return "done", "回答"
+
+        app = make_app(self.factory, MemoryLockPool(), model, Admission())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            request = asyncio.create_task(client.post(
+                "/api/chat", headers={"x-test-user": str(self.owner)},
+                json={"session_id": str(self.session.id), "request_id": str(uuid.uuid4()),
+                      "message": "问题"},
+            ))
+            try:
+                await asyncio.wait_for(finishing.wait(), 2)
+                self.assertFalse(request.done())
+            finally:
+                allow_finish.set()
+            result = await asyncio.wait_for(request, 2)
+        self.assertIn("event: done", result.text)
+        self.assertEqual(steps, ["admit", "model", "finish"])
+
+    async def test_gateway_denial_prevents_model_call(self):
+        calls = []
+
+        class Admission:
+            async def admit(self, _db, _run_id, _owner_id, _timeout):
+                raise AdmissionDenied("GATEWAY_RPM_EXCEEDED")
+
+            async def after_execution(self, *_args):
+                calls.append("finish")
+
+        async def model(**_kwargs):
+            calls.append("model")
+            return "done", "回答"
+
+        app = make_app(self.factory, MemoryLockPool(), model, Admission())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            payload = {"session_id": str(self.session.id), "request_id": str(uuid.uuid4()),
+                       "message": "问题"}
+            result = await client.post(
+                "/api/chat", headers={"x-test-user": str(self.owner)},
+                json=payload,
+            )
+            replay = await client.post(
+                "/api/chat", headers={"x-test-user": str(self.owner)}, json=payload,
+            )
+        self.assertIn('"code": "GATEWAY_RPM_EXCEEDED"', result.text)
+        self.assertIn('"code": "GATEWAY_RPM_EXCEEDED"', replay.text)
+        self.assertIn("请求过于频繁", replay.text)
+        self.assertEqual(calls, [])
 
     async def test_create_validation_authorization_and_replay_over_http(self):
         calls = []

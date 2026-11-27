@@ -11,7 +11,7 @@ class BudgetExceeded(RuntimeError):
     code = "GATEWAY_BUDGET_EXCEEDED"
 
 
-def _money(value: Decimal, *, positive: bool = False) -> Decimal:
+def validate_amount(value: Decimal, *, positive: bool = False) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite():
         raise ValueError("预算金额必须是有限 Decimal")
     if value < 0 or (positive and value == 0):
@@ -36,25 +36,25 @@ class BudgetSnapshot:
         if len(self.currency) != 3 or not all("A" <= char <= "Z" for char in self.currency):
             raise ValueError("币种必须是三个大写 ASCII 字母")
         for value in (self.limit, self.spent, self.reserved):
-            _money(value)
+            validate_amount(value)
         if self.limit <= 0:
             raise ValueError("预算上限必须大于零")
 
     def admit(self, amount: Decimal) -> "BudgetSnapshot":
         """预留必须先于上游请求；持久层用行锁或等价 CAS 原子检查并写入。"""
-        amount = _money(amount, positive=True)
+        amount = validate_amount(amount, positive=True)
         if self.spent + self.reserved + amount > self.limit:
             raise BudgetExceeded(BudgetExceeded.code)
         return BudgetSnapshot(self.currency, self.limit, self.spent, self.reserved + amount)
 
     def settle(self, reserved_amount: Decimal, confirmed_cost: Decimal | None) -> "BudgetSnapshot":
         """未知费用继续占用预留；已确认费用即使超出预留也要如实入账。"""
-        reserved_amount = _money(reserved_amount, positive=True)
+        reserved_amount = validate_amount(reserved_amount, positive=True)
         if reserved_amount > self.reserved:
             raise ValueError("结算金额超过当前预留")
         if confirmed_cost is None:
             return self
-        confirmed_cost = _money(confirmed_cost)
+        confirmed_cost = validate_amount(confirmed_cost)
         return BudgetSnapshot(
             self.currency, self.limit,
             self.spent + confirmed_cost,

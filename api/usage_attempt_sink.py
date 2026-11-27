@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from api.models import GatewayModelCall, GatewayPriceVersion, GatewayUsageEvent
+from api.models import AgentRun, GatewayModelCall, GatewayPriceVersion, GatewayUsageEvent
 from api.usage_storage import finish_model_call, record_usage_receipt, start_model_call
 from src.agent.physical_transport import MeteredRun
 from src.agent.usage_pricing import PriceVersion, TokenUsage, calculate_cost
@@ -49,6 +49,12 @@ class DatabaseAttemptSink:
     def start(self, run: MeteredRun, provider: str, model: str) -> uuid.UUID:
         now = datetime.now(UTC)
         with Session(self._engine(), expire_on_commit=False) as db:
+            # 同步 Memory 路径也锁 Run，防止终态或预算结算后继续发送物理请求。
+            stored = db.scalar(select(AgentRun).where(
+                AgentRun.id == run.run_id, AgentRun.owner_id == run.owner_id,
+            ).with_for_update())
+            if stored is None or stored.status not in {"created", "running"} or stored.recovery_required:
+                raise ValueError("Run 不可再发起模型调用")
             price = db.scalar(select(GatewayPriceVersion).where(
                 GatewayPriceVersion.provider == provider,
                 GatewayPriceVersion.model == model,
@@ -86,9 +92,13 @@ class DatabaseAttemptSink:
 
     def record_usage(self, call_id: uuid.UUID, status: str, usage: TokenUsage) -> None:
         with Session(self._engine()) as db:
-            call = db.get(GatewayModelCall, call_id)
+            # 先锁物理调用再锁 Run；预算结算持有 Run 行锁时，后到回执留待再次对账。
+            call = db.scalar(select(GatewayModelCall).where(
+                GatewayModelCall.id == call_id,
+            ).with_for_update())
             if call is None:
                 raise RuntimeError("模型调用不存在，不能记录供应商用量")
+            db.scalar(select(AgentRun).where(AgentRun.id == call.run_id).with_for_update())
             price = db.get(GatewayPriceVersion, call.price_version_id) if call.price_version_id else None
             snapshot = (PriceVersion(
                 price.id, price.currency, price.input_per_million,

@@ -254,6 +254,72 @@ class GatewayCallReconciliation(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class GatewayBudgetAccount(Base):
+    """用户按 UTC 日期和币种隔离的预算真相；预留必须锁定本行。"""
+
+    __tablename__ = "gateway_budget_accounts"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "currency", "budget_date", name="uq_gateway_budget_scope"),
+        CheckConstraint("limit_amount > 0 AND spent_amount >= 0 AND reserved_amount >= 0",
+                        name="ck_gateway_budget_amounts"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    budget_date: Mapped[date] = mapped_column(Date, nullable=False)
+    limit_amount: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    spent_amount: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False, server_default="0")
+    reserved_amount: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class GatewayBudgetReservation(Base):
+    """每个 Run 最多一次预算预留；未知上游费用仍保持 reserved。"""
+
+    __tablename__ = "gateway_budget_reservations"
+    __table_args__ = (
+        CheckConstraint("reserved_amount > 0", name="ck_gateway_reservation_positive"),
+        CheckConstraint("status IN ('reserved','settled')", name="ck_gateway_reservation_status"),
+        CheckConstraint("(status = 'reserved' AND confirmed_cost IS NULL) OR "
+                        "(status = 'settled' AND confirmed_cost >= 0)",
+                        name="ck_gateway_reservation_settlement"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_runs.id", ondelete="RESTRICT"), nullable=False, unique=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("gateway_budget_accounts.id", ondelete="RESTRICT"), nullable=False)
+    reserved_amount: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="reserved")
+    confirmed_cost: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class GatewayBudgetAdjustment(Base):
+    """每次确认或更正费用保留一条不可变的账户变动记录。"""
+
+    __tablename__ = "gateway_budget_adjustments"
+    __table_args__ = (
+        CheckConstraint("previous_cost >= 0 AND confirmed_cost >= 0",
+                        name="ck_gateway_budget_adjustment_costs"),
+        CheckConstraint("delta = confirmed_cost - previous_cost",
+                        name="ck_gateway_budget_adjustment_delta"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    reservation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("gateway_budget_reservations.id", ondelete="RESTRICT"), nullable=False,
+    )
+    previous_cost: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    confirmed_cost: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    delta: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
 class KnowledgeDocument(Base):
     """Catalog for the shared knowledge base; Milvus stores its active chunks."""
 

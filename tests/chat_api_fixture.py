@@ -60,7 +60,7 @@ def load_definitions(path, names, namespace):
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), "exec"), namespace)
 
 
-def make_app(factory, pool, model):
+def make_app(factory, pool, model, admission=None):
     async def get_db():
         async with factory() as db:
             yield db
@@ -87,6 +87,7 @@ def make_app(factory, pool, model):
     app = FastAPI()
     app.state.agent = object()
     app.state.chat_lock_pool = pool
+    app.state.gateway_admission = admission
     app.post("/api/sessions", status_code=201)(ns["create_chat_session"])
     # Use the production decorator path so a missing route migration fails tests.
     server_tree = ast.parse((ROOT / "api/server.py").read_text())

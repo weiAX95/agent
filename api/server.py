@@ -17,6 +17,7 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
+from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.agent.checkpoint import (
@@ -34,6 +35,7 @@ from api.gateway import ChatBodyLimitMiddleware
 from api.base import Base
 from api.db import check_db_connection, engine, get_db
 from api.routers import auth, feedback, knowledge, paths, run_diagnostics, sessions, tasks, topics
+from api.run_admission import GatewayAdmissionPolicy, RunAdmission
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,16 @@ async def lifespan(app: FastAPI):
 
     pool = None
     lock_pool = None
+    gateway_redis = None
+    gateway_policy = None
     try:
+        if settings.gateway_admission_enabled:
+            gateway_policy = GatewayAdmissionPolicy(
+                settings.gateway_rpm_limit, settings.gateway_concurrent_limit,
+                settings.gateway_budget_currency, settings.gateway_reservation_amount,
+            )
+            if not settings.gateway_redis_url:
+                raise RuntimeError("M4 已启用但 GATEWAY_REDIS_URL 未配置")
         async with engine.begin() as conn:
             # Coordinate first-time schema migration across API workers.
             await conn.execute(
@@ -69,6 +80,8 @@ async def lifespan(app: FastAPI):
                             "agent_runs", "agent_run_reconciliations",
                             "gateway_price_versions", "gateway_model_calls", "gateway_usage_events",
                             "gateway_call_reconciliations",
+                            "gateway_budget_accounts", "gateway_budget_reservations",
+                            "gateway_budget_adjustments",
                         }],
             )
             if (await conn.scalar(text("SELECT to_regclass('public.agent_runs')")) is None
@@ -88,6 +101,12 @@ async def lifespan(app: FastAPI):
                 "AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'gateway_call_reconciliation_append_only')"
             )):
                 raise RuntimeError("请先执行全部 M3 gateway_usage、call_price_snapshot、ledger_append_only 和 call_reconciliations 迁移")
+            if gateway_policy and not await conn.scalar(text(
+                "SELECT to_regclass('public.gateway_budget_accounts') IS NOT NULL "
+                "AND to_regclass('public.gateway_budget_reservations') IS NOT NULL "
+                "AND to_regclass('public.gateway_budget_adjustments') IS NOT NULL"
+            )):
+                raise RuntimeError("请先执行 migrations/20261124_gateway_budget_reservations.sql")
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
                 "model_profile VARCHAR(32) NOT NULL DEFAULT 'default'"
@@ -127,6 +146,12 @@ async def lifespan(app: FastAPI):
             open=False,
         )
         await lock_pool.open(wait=True)
+        if gateway_policy:
+            gateway_redis = Redis.from_url(settings.gateway_redis_url, decode_responses=True)
+            await gateway_redis.ping()
+        app.state.gateway_admission = (
+            RunAdmission(gateway_redis, gateway_policy) if gateway_policy else None
+        )
         app.state.chat_lock_pool = lock_pool
         app.state.model_profiles = profiles
         app.state.default_model_profile = default_profile
@@ -138,6 +163,8 @@ async def lifespan(app: FastAPI):
                 app.state.agents[name] = build_agent(checkpointer, name, initialize=False)
         yield
     finally:
+        if gateway_redis is not None:
+            await gateway_redis.aclose()
         if lock_pool is not None:
             await lock_pool.close()
         if pool is not None:
@@ -232,6 +259,7 @@ async def chat_api(
             turn.model_profile, http_request.app.state.agent
         ), chat_stream, _usage_payload, turn.model_profile,
         getattr(http_request, "scope", {}).get("gateway_trace_id"),
+        getattr(http_request.app.state, "gateway_admission", None),
     )
 
 

@@ -20,6 +20,15 @@ from src.agent.run_policy import RunLimitError
 
 logger = logging.getLogger(__name__)
 
+GATEWAY_ERROR_MESSAGES = {
+    "GATEWAY_RPM_EXCEEDED": "请求过于频繁，请稍后重试。",
+    "GATEWAY_CONCURRENCY_EXCEEDED": "当前并发请求已满，请稍后重试。",
+    "GATEWAY_RUN_ALREADY_ADMITTED": "本次执行已申请过准入，请勿重复发起。",
+    "GATEWAY_ADMISSION_UNAVAILABLE": "网关准入暂不可用，请稍后重试。",
+    "GATEWAY_BUDGET_NOT_CONFIGURED": "当前账户尚未配置模型预算。",
+    "GATEWAY_BUDGET_EXCEEDED": "当前预算额度不足。",
+}
+
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -50,14 +59,16 @@ def terminal_event(turn: ChatTurn):
         return name, {**ids, "answer": answer, "chat_log_id": str(turn.log_id),
                       "memory_status": message.memory_status or "unknown"}
     return "error", {**ids, "code": message.error_code,
-                     "message": MODEL_ERROR_MESSAGES.get(
-                         message.error_code,
-                         "上次请求未完成，请使用新请求重试；异常中断的会话需要先核对上下文",
+                     "message": GATEWAY_ERROR_MESSAGES.get(
+                         message.error_code, MODEL_ERROR_MESSAGES.get(
+                             message.error_code,
+                             "上次请求未完成，请使用新请求重试；异常中断的会话需要先核对上下文",
+                         ),
                      )}
 
 
 def persisted_chat_response(turn, agent, chat_stream, usage_payload,
-                            model_profile=None, trace_id=None):
+                            model_profile=None, trace_id=None, run_admission=None):
     async def replay():
         name, payload = terminal_event(turn)
         yield encode_event(name, payload)
@@ -121,9 +132,31 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
             profile_token = active_model_profile.set(model_profile)
             metering_token = None
             deadline_scope = None
+            admitted = False
+
+            async def finalize_admission():
+                nonlocal admitted
+                if not admitted:
+                    return
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await run_admission.after_execution(
+                            turn.db, turn.run_id, turn.owner_id,
+                        )
+                    except Exception:
+                        logger.exception("Gateway finalization failed; run_id=%s", turn.run_id)
+                admitted = False
+
             try:
                 try:
                     controller = await turn.start_run()
+                    if run_admission is not None:
+                        # Run 已提交、模型尚未发送；Redis 准入和预算预留先在此完成。
+                        await run_admission.admit(
+                            turn.db, turn.run_id, turn.owner_id,
+                            controller.limits.timeout_seconds,
+                        )
+                        admitted = True
                     # 所有同步 Memory 与异步 Agent 请求继承同一 Run 身份。
                     metering_token = active_metered_run.set(MeteredRun(
                         turn.run_id, turn.owner_id, trace_id,
@@ -149,6 +182,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     # A model that propagates cancellation has not confirmed checkpoint cleanup.
                     with anyio.CancelScope(shield=True):
                         await record_failure("CHECKPOINT_RECOVERY_REQUIRED", partial, True)
+                        await finalize_admission()
                     await queue.put(("error", {
                         "code": "CHECKPOINT_RECOVERY_REQUIRED",
                         "message": "生成异常中断，请使用新会话或先核对上下文。",
@@ -165,6 +199,9 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                         code = None
                     if code is not None:
                         message = MODEL_ERROR_MESSAGES[code]
+                    elif getattr(exc, "code", None) in GATEWAY_ERROR_MESSAGES:
+                        code = exc.code
+                        message = GATEWAY_ERROR_MESSAGES[code]
                     else:
                         failure = classify_model_error(exc)
                         code, message = failure or (
@@ -172,6 +209,7 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                         )
                     logger.exception("Chat generation failed; request_id=%s code=%s", turn.request_id, code)
                     await record_failure(code, partial)
+                    await finalize_admission()
                     await queue.put(("usage", usage_payload(usage)))
                     await queue.put(("error", {"code": code, "message": message}))
                     return
@@ -194,6 +232,8 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     await queue.put(("agent_step", memory_event))
                     await turn.finish("completed" if status == "done" else "stopped", answer or "",
                                       memory_status=memory_status)
+                    # 先结算和清理，再发 SSE 终止事件；断线不能打断已确认终态的清理。
+                    await finalize_admission()
                 await queue.put(("usage", usage_payload(usage)))
                 await queue.put(terminal_event(turn))
                 logger.info(
@@ -207,10 +247,13 @@ def persisted_chat_response(turn, agent, chat_stream, usage_payload,
                     try:
                         await turn.db.rollback()
                         await record_failure("CHECKPOINT_RECOVERY_REQUIRED", partial, True)
+                        await finalize_admission()
                     except Exception:
                         logger.exception("Could not mark interrupted request_id=%s", turn.request_id)
                 await queue.put(("error", {"code": "SAVE_FAILED", "message": "保存对话失败，执行结果待核对；请勿直接重复生成。"}))
             finally:
+                if admitted:
+                    await finalize_admission()
                 if metering_token is not None:
                     active_metered_run.reset(metering_token)
                 active_model_profile.reset(profile_token)

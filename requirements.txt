@@ -154,6 +154,7 @@ python-oxmsg==0.0.2
 pytz==2026.3.post1
 PyYAML==6.0.3
 RapidFuzz==3.14.6
+redis==8.1.0
 regex==2026.9.3
 reportlab==5.0.1
 requests==2.34.2
